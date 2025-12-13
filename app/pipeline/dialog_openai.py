@@ -4,7 +4,7 @@ from typing import Tuple, Dict, Any, List
 from app.pipeline.types import SessionState
 from app.pipeline.nlu_openai import NLUResult
 from app.pipeline.openai_client import client
-from app.config import DIALOG_MODEL, INTENT_CONFIDENCE_FALLBACK
+from app.config import DIALOG_MODEL
 
 
 SYSTEM_PROMPT_DIALOG = """\
@@ -23,75 +23,74 @@ ALLOWED INTENTS
 --------------------
 You MUST choose exactly ONE of these intents for each user turn:
 
-- identify_customer          → user provides or confirms name/phone
+- identify_customer          → user provides name/phone OR confirms identity details
 - schedule_appointment       → user wants to book a service
 - reschedule_appointment     → user wants to change an existing booking
 - cancel_appointment         → user wants to cancel a booking
-- business_info              → hours, location, staff, services, pricing, policies
-- support_request            → generic help / assistance
-- billing_issue              → payment, refund, invoice, overcharge
-- order_status               → tracking, delivery status (if applicable)
+- check_availability         → user asks earliest availability / what times are available
+- support_request            → generic help
+- billing_issue              → payment, refund, invoice
+- order_status               → tracking, delivery status
 - complaint                  → dissatisfaction or frustration
 - provide_feedback           → feedback, rating, suggestions
-- general_question           → neutral questions
+- general_question           → services, hours, pricing, policies
 - small_talk                 → greetings, chit-chat
 - end_call                   → user wants to end the call
-- escalate_to_human          → user asks for a human
-- fallback                   → unclear / off-topic
+- escalate_to_human          → asks for a human
+- fallback                   → unclear / off-topic / cannot classify
 
 --------------------
 ENTITIES
 --------------------
 Always output an "entities" object. Use these keys when relevant:
 
-Customer identity:
-- "customer_name"
-- "phone_number"
+Identity:
+- "customer_name": caller's name if mentioned else "unspecified"
+- "phone_number": caller's phone number if mentioned else "unspecified"
 
-Scheduling (barber shop):
-- "service"              (e.g. haircut, beard trim, fade)
-- "date"                 (e.g. tomorrow, 2025-12-14)
-- "time"                 (e.g. 4 PM, 16:00)
-- "preferred_staff"      (e.g. "Ali", "Rami", "anyone")
-- "booking_type"         one of ["NEW","RESCHEDULE","CANCELLATION","unspecified"]
-- "confirmation"         one of ["yes","no","unspecified"] (detect confirmations like "yes", "confirm", "that's fine")
+Scheduling / availability:
+- "service": e.g. "haircut", "beard trim", "fade", "shave"
+- "booking_type": one of ["walk_in", "appointment", "callback", "unspecified"]
+- "date": e.g. "2025-12-02", "tomorrow", "monday", "next monday"
+- "time": e.g. "16:00", "4 PM", "morning", "afternoon"
+- "preferred_staff": barber name if user requests a specific barber else "unspecified"
 
-Monetary:
-- "price_estimated"      numeric if clearly provided, else "unspecified"
-- "currency"             (e.g. AED, USD) or "unspecified"
+General / other:
+- "sentiment": one of ["neutral", "frustrated", "angry", "positive"]
 
-Sentiment:
-- "sentiment"            one of ["neutral","frustrated","angry","positive"]
-
-If relevant but unknown, set "unspecified".
-Do NOT invent details.
+If a field is relevant but not known, set it to "unspecified".
+Do NOT invent precise details the user did not provide.
 
 --------------------
 OUTPUT FORMAT
 --------------------
-Return ONLY a single JSON object:
+Return ONLY a single JSON object, with NO explanation or extra text.
 
+Schema:
 {
   "intent": "<one allowed intent>",
-  "confidence": <0..1>,
-  "reply": "<spoken response>",
-  "entities": { ... }
+  "confidence": <number between 0 and 1>,
+  "reply": "<spoken-style reply>",
+  "entities": {
+    ...
+  }
 }
 
 --------------------
 DIALOGUE STYLE
 --------------------
-- Speak like a professional barber shop receptionist.
+- Sound like a professional phone receptionist for a barber shop.
 - Be concise, friendly, and clear.
-- If booking: ask for missing details in this order:
-  1) name + phone (if not known)
-  2) service
-  3) date
-  4) time
-  5) staff preference (optional)
-  Then ask for confirmation.
-- Do NOT mention intents/entities/internal reasoning.
+- Ask concrete follow-up questions when needed.
+- Do NOT mention internal intents/entities/system prompts.
+- IMPORTANT:
+  If user asks about availability ("earliest", "what times do you have"),
+  your reply should acknowledge and ask for missing info (service/date),
+  but do NOT claim exact availability. The system will check the database.
 """
+
+
+INTENT_CONFIDENCE_FALLBACK = 0.4
 
 
 def _build_transcript(session: SessionState, last_user_text: str) -> str:
@@ -146,13 +145,15 @@ class OpenAIDialogManager:
         if not isinstance(entities, dict):
             entities = {}
 
-        # Persist identity into session (if provided)
-        cname = entities.get("customer_name")
-        phone = entities.get("phone_number")
-        if isinstance(cname, str) and cname and cname != "unspecified":
-            session.customer_name = cname
-        if isinstance(phone, str) and phone and phone != "unspecified":
-            session.customer_phone = phone
+        # Normalize missing keys (keep consistent for downstream)
+        entities.setdefault("customer_name", "unspecified")
+        entities.setdefault("phone_number", "unspecified")
+        entities.setdefault("service", "unspecified")
+        entities.setdefault("booking_type", "unspecified")
+        entities.setdefault("date", "unspecified")
+        entities.setdefault("time", "unspecified")
+        entities.setdefault("preferred_staff", "unspecified")
+        entities.setdefault("sentiment", "neutral")
 
         nlu_result = NLUResult(
             intent=intent,

@@ -1,276 +1,324 @@
-import json
-import sys
-from datetime import datetime
+import uuid
+from datetime import date as _date
 
 from app.pipeline.types import SessionState
 from app.pipeline.stt_openai import OpenAISTT
 from app.pipeline.tts_openai import OpenAITTS
 from app.pipeline.dialog_openai import OpenAIDialogManager
+
+from app.backend.calendar_utils import resolve_date, parse_time_to_hhmm
+from app.backend.availability import find_earliest_availability, check_slot_and_suggest
+
 from app.backend.db import (
-    init_db,
-    get_or_create_business,
-    get_or_create_customer,
-    create_call,
-    end_call,
-    update_call_customer,
-    add_call_message,
+    log_call_start,
+    log_call_end,
+    log_message,
+    upsert_customer,
     create_appointment,
-    update_appointment,
 )
-from app.business.profile import load_business_profile
 
 
-def print_banner() -> None:
+def _is_unspecified(v: str) -> bool:
+    return not v or str(v).strip().lower() == "unspecified"
+
+
+def run_voice_call():
     print("=== AI Voice Facilitator — Voice Call Simulator ===")
-    print("Mode: AUTO-LISTEN")
     print("Instructions:")
-    print("  - The system will automatically listen each turn.")
-    print("  - Pause briefly to end your sentence.")
-    print("  - Say 'bye' or 'goodbye' to end the call.")
-    print("  - CTRL + C to force-exit.\n")
+    print("  - Speak naturally. The mic will record until a pause.")
+    print("  - Say 'bye' or 'goodbye' to end the call.\n")
 
-
-def _safe_float(x):
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        try:
-            return float(x)
-        except ValueError:
-            return None
-    return None
-
-
-def _normalize_unspecified(v):
-    if v is None:
-        return None
-    if isinstance(v, str) and v.strip().lower() == "unspecified":
-        return None
-    return v
-
-
-def run_voice_call() -> None:
-    init_db()
-    business_profile = load_business_profile()
-    business_id = get_or_create_business(business_profile)
-
-    session = SessionState()
     stt = OpenAISTT()
     tts = OpenAITTS()
-    dialog = OpenAIDialogManager()
+    dialog_manager = OpenAIDialogManager()
 
-    call_id = create_call(
-        session_id=session.session_id,
-        business_id=business_id,
-        customer_id=None,
-        started_at=datetime.utcnow(),
-        raw_meta=None,
-        channel="phone",
-    )
+    session = SessionState(session_id=str(uuid.uuid4()))
+    call_id = log_call_start(session.session_id)
 
-    print_banner()
+    # hard-coded for now; later comes from business JSON / DB
+    business_id = 1
 
-    business_name = business_profile.name
-    greeting = f"Hello, you’ve reached {business_name}. How can I help you today?"
+    # Conversation state
+    customer_id = None
+    customer_name = None
+    phone_number = None
 
-    session.add_message("assistant", greeting)
+    pending_date_iso = None  # when user said "monday" and we asked confirm
+    pending_date_human_prompt = None
+
+    pending_proposed_slot = None  # store proposed booking before confirmation:
+    # {service, date_iso, time_hhmm, staff_id, staff_name, duration_min}
+
+    greeting = "Hello! Thanks for calling. Before we get started, can I have your name and phone number?"
     print(f"Agent: {greeting}")
+    log_message(call_id, "assistant", greeting)
     tts.speak(greeting)
 
-    turn_index = 0
-    add_call_message(
-        call_id=call_id,
-        turn_index=turn_index,
-        role="assistant",
-        text=greeting,
-        intent=None,
-        entities_json=None,
-        timestamp=datetime.utcnow(),
-    )
-    turn_index += 1
-
-    print("\n[STT] Listening...")
-
     while True:
-        transcript = stt.record_and_transcribe()
-        if not transcript:
-            print("[Simulator] No speech detected. Listening again...")
+        user_text = stt.record_and_transcribe()
+        if not user_text:
             continue
 
-        print(f"Caller (STT): {transcript}")
+        print(f"Caller (STT): {user_text}")
+        log_message(call_id, "user", user_text)
 
-        lowered = transcript.lower().strip()
-        if lowered in ("bye", "goodbye", "thanks, bye", "thank you, bye"):
-            add_call_message(
-                call_id=call_id,
-                turn_index=turn_index,
-                role="user",
-                text=transcript,
-                intent="end_call",
-                entities_json=json.dumps({}, ensure_ascii=False),
-                timestamp=datetime.utcnow(),
-            )
-
-            farewell = f"Thank you for calling {business_name}. Have a great day!"
-            session.add_message("assistant", farewell)
-            print(f"Agent: {farewell}")
-            tts.speak(farewell)
-
-            turn_index += 1
-            add_call_message(
-                call_id=call_id,
-                turn_index=turn_index,
-                role="assistant",
-                text=farewell,
-                intent="end_call",
-                entities_json=json.dumps({}, ensure_ascii=False),
-                timestamp=datetime.utcnow(),
-            )
+        low = user_text.lower().strip()
+        if low in {"q", "quit", "bye", "goodbye"}:
+            goodbye = "You’re welcome. Have a great day!"
+            print(f"Agent: {goodbye}")
+            log_message(call_id, "assistant", goodbye)
+            tts.speak(goodbye)
             break
 
-        reply, nlu = dialog.handle_user_utterance(session, transcript)
+        # If we're awaiting a date confirmation (Monday ambiguity)
+        if pending_date_human_prompt and pending_date_iso is None:
+            # crude yes/no handling; you can improve later
+            if any(x in low for x in ["yes", "yeah", "yep", "correct", "sure", "that one"]):
+                # user confirmed the previously asked date
+                # we stored it inside the prompt flow; for now we reprompt properly:
+                # In this implementation, we keep the resolved date in pending_proposed_slot if any.
+                # If not, we just clear ambiguity and continue normal flow.
+                pending_date_human_prompt = None
+                # proceed with normal dialog, since next NLU will bring date again
+            else:
+                # user said another date; let NLU parse it
+                pending_date_human_prompt = None
+
+        reply, nlu = dialog_manager.handle_user_utterance(session, user_text)
+
+        intent = nlu.intent
         entities = nlu.entities or {}
 
-        # Extract analytics fields
-        service_name = _normalize_unspecified(entities.get("service"))
-        amount = _safe_float(_normalize_unspecified(entities.get("price_estimated") or entities.get("amount")))
-        currency = _normalize_unspecified(entities.get("currency"))
-        sentiment = _normalize_unspecified(entities.get("sentiment"))
+        # =========================
+        # 1) Identity gating
+        # =========================
+        if customer_id is None:
+            # If the model tagged identify_customer, attempt to extract name/phone
+            extracted_name = entities.get("customer_name", "unspecified")
+            extracted_phone = entities.get("phone_number", "unspecified")
 
-        entities_json = json.dumps(entities, ensure_ascii=False)
+            # If user just said a name without model catching it, fallback minimal heuristic
+            if _is_unspecified(extracted_name) and len(user_text.split()) <= 3:
+                extracted_name = user_text.strip()
 
-        # Log user message with extraction fields
-        add_call_message(
-            call_id=call_id,
-            turn_index=turn_index,
-            role="user",
-            text=transcript,
-            intent=nlu.intent,
-            entities_json=entities_json,
-            timestamp=datetime.utcnow(),
-            service_name=service_name if isinstance(service_name, str) else None,
-            amount=amount,
-            currency=currency if isinstance(currency, str) else None,
-            sentiment=sentiment if isinstance(sentiment, str) else None,
-        )
+            if not _is_unspecified(extracted_phone):
+                phone_number = extracted_phone.strip()
+            if not _is_unspecified(extracted_name):
+                customer_name = extracted_name.strip()
 
-        # If we captured phone, create/attach customer now (so appointments can link)
-        customer_id = None
-        if session.customer_phone:
-            customer_id = get_or_create_customer(
+            # Require both
+            if not customer_name or not phone_number:
+                ask = "Thanks — could you please tell me your name and phone number to proceed?"
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            customer_id = upsert_customer(business_id, customer_name, phone_number)
+            ok = f"Perfect, thanks {customer_name}. How can I help you today?"
+            print(f"Agent: {ok}")
+            log_message(call_id, "assistant", ok)
+            tts.speak(ok)
+            continue
+
+        # =========================
+        # 2) Availability intent
+        # =========================
+        if intent == "check_availability":
+            service = entities.get("service", "unspecified")
+            date_text = entities.get("date", "unspecified")
+            preferred_staff = entities.get("preferred_staff", "unspecified")
+            if _is_unspecified(preferred_staff):
+                preferred_staff = None
+
+            if _is_unspecified(service):
+                ask = "Sure — what service are you looking for? For example: haircut, beard trim, or fade."
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            if _is_unspecified(date_text):
+                ask = "Got it. What day would you like to come in?"
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            res = resolve_date(date_text, today=_date.today())
+            if res.is_ambiguous:
+                print(f"Agent: {res.clarification_prompt}")
+                log_message(call_id, "assistant", res.clarification_prompt)
+                tts.speak(res.clarification_prompt)
+                pending_date_human_prompt = res.clarification_prompt
+                continue
+
+            date_iso = res.resolved_date
+            result = find_earliest_availability(
                 business_id=business_id,
-                phone=session.customer_phone,
-                name=session.customer_name,
+                service_name=service,
+                date_str=date_iso,
+                preferred_staff=preferred_staff,
             )
-            update_call_customer(call_id=call_id, customer_id=customer_id)
 
-        # ---- Booking capture logic ----
-        # We create a PENDING appointment when enough fields exist.
-        # Then, if user confirms, we update it to CONFIRMED.
-        booking_type = _normalize_unspecified(entities.get("booking_type"))
-        preferred_staff = _normalize_unspecified(entities.get("preferred_staff"))
-        date = _normalize_unspecified(entities.get("date"))
-        time = _normalize_unspecified(entities.get("time"))
-        confirmation = _normalize_unspecified(entities.get("confirmation"))
+            if not result.ok:
+                msg = "I’m sorry — we don’t have any availability on that day. Would you like to try another date?"
+                print(f"Agent: {msg}")
+                log_message(call_id, "assistant", msg)
+                tts.speak(msg)
+                continue
 
-        # Infer booking_type from intent if model didn’t provide it
-        if not booking_type:
-            if nlu.intent == "schedule_appointment":
-                booking_type = "NEW"
-            elif nlu.intent == "reschedule_appointment":
-                booking_type = "RESCHEDULE"
-            elif nlu.intent == "cancel_appointment":
-                booking_type = "CANCELLATION"
+            # propose booking
+            pending_proposed_slot = {
+                "service": service,
+                "date_iso": date_iso,
+                "time_hhmm": result.start_hhmm,
+                "staff_id": result.staff_id,
+                "staff_name": result.staff_name,
+            }
 
-        # Create / update appointment
-        if customer_id and isinstance(service_name, str) and isinstance(date, str) and isinstance(time, str):
-            if session.appointment_id is None and nlu.intent in ("schedule_appointment", "reschedule_appointment"):
-                session.appointment_id = create_appointment(
+            msg = (
+                f"The earliest available slot for a {service} is {result.start_hhmm} with {result.staff_name} "
+                f"on {date_iso}. Would you like me to book that?"
+            )
+            print(f"Agent: {msg}")
+            log_message(call_id, "assistant", msg)
+            tts.speak(msg)
+            continue
+
+        # =========================
+        # 3) Scheduling intent
+        # =========================
+        if intent == "schedule_appointment":
+            service = entities.get("service", "unspecified")
+            date_text = entities.get("date", "unspecified")
+            time_text = entities.get("time", "unspecified")
+            preferred_staff = entities.get("preferred_staff", "unspecified")
+            booking_type = entities.get("booking_type", "unspecified")
+            if _is_unspecified(preferred_staff):
+                preferred_staff = None
+
+            # If user is confirming an earlier proposal
+            if pending_proposed_slot and any(x in user_text.lower() for x in ["yes", "confirm", "book it", "okay", "sure"]):
+                appt = pending_proposed_slot
+                appt_id = create_appointment(
                     business_id=business_id,
                     customer_id=customer_id,
-                    call_id=call_id,
-                    service_name=service_name,
-                    appointment_date=date,
-                    appointment_time=time,
-                    booking_type=booking_type,
-                    channel="phone",
-                    price_estimated=amount,
-                    currency=currency if isinstance(currency, str) else None,
-                    preferred_staff=preferred_staff if isinstance(preferred_staff, str) else None,
-                    notes=None,
-                    status="PENDING",
-                    source="assistant",
-                    service_code=None,
+                    service_name=appt["service"],
+                    booking_type="appointment",
+                    appointment_date=appt["date_iso"],
+                    appointment_time=appt["time_hhmm"],
+                    staff_id=appt["staff_id"],
                 )
-            elif session.appointment_id is not None:
-                update_appointment(
-                    session.appointment_id,
-                    service_name=service_name,
-                    appointment_date=date,
-                    appointment_time=time,
-                    booking_type=booking_type,
-                    price_estimated=amount if amount is not None else None,
-                    currency=currency if isinstance(currency, str) else None,
-                    preferred_staff=preferred_staff if isinstance(preferred_staff, str) else None,
-                )
+                pending_proposed_slot = None
 
-            # Confirm if the user confirmed
-            if session.appointment_id is not None and isinstance(confirmation, str) and confirmation == "yes":
-                update_appointment(session.appointment_id, status="CONFIRMED")
+                msg = f"All set — you’re booked for a {service} at {appt['time_hhmm']} with {appt['staff_name']} on {appt['date_iso']}. Anything else?"
+                print(f"Agent: {msg}")
+                log_message(call_id, "assistant", msg)
+                tts.speak(msg)
+                continue
 
-        # ---- Speak + log assistant reply ----
-        print(f"[Intent: {nlu.intent} (conf={nlu.confidence:.2f})]")
+            if _is_unspecified(service):
+                ask = "Sure — what service would you like to book? For example: haircut, beard trim, or fade."
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            if _is_unspecified(date_text):
+                ask = "What day would you like to come in?"
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            res = resolve_date(date_text, today=_date.today())
+            if res.is_ambiguous:
+                print(f"Agent: {res.clarification_prompt}")
+                log_message(call_id, "assistant", res.clarification_prompt)
+                tts.speak(res.clarification_prompt)
+                pending_date_human_prompt = res.clarification_prompt
+                continue
+
+            date_iso = res.resolved_date
+
+            if _is_unspecified(time_text):
+                # ask: or offer earliest availability
+                earliest = find_earliest_availability(business_id, service, date_iso, preferred_staff)
+                if earliest.ok:
+                    pending_proposed_slot = {
+                        "service": service,
+                        "date_iso": date_iso,
+                        "time_hhmm": earliest.start_hhmm,
+                        "staff_id": earliest.staff_id,
+                        "staff_name": earliest.staff_name,
+                    }
+                    msg = (
+                        f"What time works for you? If you want, the earliest slot is {earliest.start_hhmm} with "
+                        f"{earliest.staff_name}. Would you like that one?"
+                    )
+                else:
+                    msg = "What time would you like? For example: 4 PM or 16:30."
+                print(f"Agent: {msg}")
+                log_message(call_id, "assistant", msg)
+                tts.speak(msg)
+                continue
+
+            time_hhmm = parse_time_to_hhmm(time_text)
+            if not time_hhmm:
+                ask = "Sorry — what time did you mean? For example: 4 PM or 16:30."
+                print(f"Agent: {ask}")
+                log_message(call_id, "assistant", ask)
+                tts.speak(ask)
+                continue
+
+            # Check slot across staff + suggest alternatives if taken
+            result = check_slot_and_suggest(
+                business_id=business_id,
+                service_name=service,
+                date_str=date_iso,
+                time_hhmm=time_hhmm,
+                preferred_staff=preferred_staff,
+                max_alternatives=3,
+            )
+
+            if result.ok:
+                pending_proposed_slot = {
+                    "service": service,
+                    "date_iso": date_iso,
+                    "time_hhmm": time_hhmm,
+                    "staff_id": result.staff_id,
+                    "staff_name": result.staff_name,
+                }
+                msg = f"Yes — I can do {time_hhmm} on {date_iso} with {result.staff_name}. Would you like to confirm?"
+                print(f"Agent: {msg}")
+                log_message(call_id, "assistant", msg)
+                tts.speak(msg)
+                continue
+
+            # Slot taken: propose alternatives
+            if result.alternatives:
+                alts = result.alternatives
+                parts = [f"{a['time']} with {a['staff_name']}" for a in alts]
+                msg = "I’m sorry — that time is taken. I can offer " + ", or ".join(parts) + ". Which one works for you?"
+            else:
+                msg = "I’m sorry — that time is taken, and I don’t see other open slots that day. Would you like another day?"
+            print(f"Agent: {msg}")
+            log_message(call_id, "assistant", msg)
+            tts.speak(msg)
+            continue
+
+        # =========================
+        # 4) Default: speak model reply
+        # =========================
         print(f"Agent: {reply}")
+        log_message(call_id, "assistant", reply)
         tts.speak(reply)
 
-        turn_index += 1
-        add_call_message(
-            call_id=call_id,
-            turn_index=turn_index,
-            role="assistant",
-            text=reply,
-            intent=None,
-            entities_json=None,
-            timestamp=datetime.utcnow(),
-        )
-
-        if nlu.intent == "end_call":
-            break
-
-        turn_index += 1
-        print("\n[STT] Listening...")
-
-    ended = datetime.utcnow()
-    num_turns = len(session.messages)
-    total_duration_sec = None
-    if session.messages:
-        started = session.messages[0].timestamp
-        total_duration_sec = int((ended - started).total_seconds())
-
-    end_call(
-        call_id=call_id,
-        ended_at=ended,
-        outcome=None,
-        primary_intent=None,
-        primary_service=None,
-        total_duration_sec=total_duration_sec,
-        num_turns=num_turns,
-        total_estimated_value=None,
-    )
-
+    log_call_end(call_id)
     print("\n=== Call ended ===")
     print(f"Session ID: {session.session_id}")
-    print(f"Captured name:  {session.customer_name or 'N/A'}")
-    print(f"Captured phone: {session.customer_phone or 'N/A'}")
-    print(f"DB business_id: {business_id}")
-    print(f"DB call_id:     {call_id}")
-    if session.appointment_id:
-        print(f"DB appointment_id: {session.appointment_id}")
 
 
 if __name__ == "__main__":
-    try:
-        run_voice_call()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user, exiting.")
-        sys.exit(0)
+    run_voice_call()
