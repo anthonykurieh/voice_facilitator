@@ -1,0 +1,116 @@
+{
+  "business": {
+    "id": "fade-blade-barbershop",
+    "name": "Fade & Blade Barber Studio",
+    "type": "barbershop",
+    "description": "A modern neighborhood barbershop offering fades, classic cuts, beard styling, and hot towel shaves in a relaxed, male-focused environment.",
+    "languages": ["en", "ar"]
+  },
+
+  "contact": {
+    "phone": "+971-50-987-6543",
+    "email": "info@fadeandblade.ae",
+    "website": "https://fadeandblade.ae",
+    "address": "Shop 12, Downtown Boulevard, Dubai, UAE"
+  },
+
+  "opening_hours": {
+    "monday": "10:00-21:00",
+    "tuesday": "10:00-21:00",
+    "wednesday": "10:00-21:00",
+    "thursday": "10:00-22:00",
+    "friday": "12:00-22:00",
+    "saturday": "10:00-22:00",
+    "sunday": "10:00-20:00"
+  },
+
+  "services": [
+    {
+      "id": "fade_classic",
+      "name": "Classic Fade",
+      "description": "Skin or low fade with scissor work on top, finished with styling product.",
+      "duration_minutes": 35,
+      "price_hint": "from 120 AED"
+    },
+    {
+      "id": "beard_trim",
+      "name": "Beard Trim & Shape",
+      "description": "Beard line-up, trimming, and shaping with razor detailing.",
+      "duration_minutes": 25,
+      "price_hint": "from 80 AED"
+    },
+    {
+      "id": "hot_towel_shave",
+      "name": "Hot Towel Shave",
+      "description": "Traditional straight-razor shave with hot towels and aftershave treatment.",
+      "duration_minutes": 40,
+      "price_hint": "from 130 AED"
+    },
+    {
+      "id": "kids_cut",
+      "name": "Kids Cut (under 12)",
+      "description": "Gentle haircut service for children under 12.",
+      "duration_minutes": 30,
+      "price_hint": "from 90 AED"
+    }
+  ],
+
+  "staff": [
+    {
+      "name": "Omar",
+      "role": "Senior Barber",
+      "specialties": ["skin fades", "beard styling", "line-ups"],
+      "languages": ["en", "ar"],
+      "years_experience": 9,
+      "works_days": ["monday", "tuesday", "wednesday", "thursday", "saturday"]
+    },
+    {
+      "name": "Karim",
+      "role": "Barber",
+      "specialties": ["classic cuts", "side parts", "kids cuts"],
+      "languages": ["en", "ar"],
+      "years_experience": 5,
+      "works_days": ["tuesday", "wednesday", "thursday", "friday", "sunday"]
+    },
+    {
+      "name": "Yousef",
+      "role": "Barber",
+      "specialties": ["long hair trims", "textured styles", "hot towel shaves"],
+      "languages": ["en"],
+      "years_experience": 7,
+      "works_days": ["monday", "wednesday", "thursday", "friday", "saturday"]
+    }
+  ],
+
+  "policies": {
+    "cancellation": "Appointments can be cancelled or rescheduled up to 4 hours in advance. Late cancellations or no-shows may be charged up to 50% of the service price.",
+    "late_arrival": "If you are more than 15 minutes late, we may need to shorten your service or reschedule to avoid delaying the next clients.",
+    "walk_ins": "Walk-ins are welcome, but availability is not guaranteed. Clients with appointments are always prioritized.",
+    "payments": "We accept cash, major credit cards, and common digital wallets."
+  },
+
+  "faq": [
+    {
+      "q": "Do you accept walk-ins?",
+      "a": "Yes, we accept walk-ins when a barber is available, but booking an appointment is recommended."
+    },
+    {
+      "q": "Can I choose a specific barber?",
+      "a": "Yes, you may request a specific barber during booking and we will assign them if they are available."
+    },
+    {
+      "q": "Do you cut kids' hair?",
+      "a": "Yes, we offer kids cuts for children under 12."
+    },
+    {
+      "q": "Do you offer beard-only services?",
+      "a": "Yes, we have dedicated beard trims and beard styling services."
+    },
+    {
+      "q": "Which barber is best for beard styling?",
+      "a": "Omar is our senior barber specializing in beard styling, fades, and line-ups."
+    }
+  ],
+
+  "kb_files": []
+}

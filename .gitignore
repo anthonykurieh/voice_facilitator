@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# OS junk
+.DS_Store
+
+# Audio temp files
+*.wav
+*.mp3
+
+# Logs
+*.log
+
+# MySQL
+*.pid
+
+# IDE
+.idea/
+.vscode/
