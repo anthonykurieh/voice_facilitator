@@ -14,6 +14,8 @@ from app.backend.db import (
     end_call,
     update_call_customer,
     add_call_message,
+    create_appointment,
+    update_appointment,
 )
 from app.business.profile import load_business_profile
 
@@ -22,25 +24,41 @@ def print_banner() -> None:
     print("=== AI Voice Facilitator — Voice Call Simulator ===")
     print("Mode: AUTO-LISTEN")
     print("Instructions:")
-    print("  - The system will automatically listen for your voice each turn.")
-    print("  - Speak after the agent finishes talking; pause to let it detect silence.")
+    print("  - The system will automatically listen each turn.")
+    print("  - Pause briefly to end your sentence.")
     print("  - Say 'bye' or 'goodbye' to end the call.")
-    print("  - Press CTRL + C at any time to force-exit.\n")
+    print("  - CTRL + C to force-exit.\n")
+
+
+def _safe_float(x):
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        try:
+            return float(x)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_unspecified(v):
+    if v is None:
+        return None
+    if isinstance(v, str) and v.strip().lower() == "unspecified":
+        return None
+    return v
 
 
 def run_voice_call() -> None:
-    # ---------- DB & business setup ----------
     init_db()
     business_profile = load_business_profile()
     business_id = get_or_create_business(business_profile)
 
-    # ---------- Session & components ----------
     session = SessionState()
     stt = OpenAISTT()
     tts = OpenAITTS()
     dialog = OpenAIDialogManager()
 
-    # Create DB call record
     call_id = create_call(
         session_id=session.session_id,
         business_id=business_id,
@@ -55,12 +73,10 @@ def run_voice_call() -> None:
     business_name = business_profile.name
     greeting = f"Hello, you’ve reached {business_name}. How can I help you today?"
 
-    # In-memory log
     session.add_message("assistant", greeting)
     print(f"Agent: {greeting}")
     tts.speak(greeting)
 
-    # Log greeting as first message
     turn_index = 0
     add_call_message(
         call_id=call_id,
@@ -71,28 +87,20 @@ def run_voice_call() -> None:
         entities_json=None,
         timestamp=datetime.utcnow(),
     )
-
-    # Next user message index
     turn_index += 1
 
-    print("\n[STT] Listening... (start speaking when you're ready)")
+    print("\n[STT] Listening...")
 
-    # ---------- Main auto-listen loop ----------
     while True:
-        # 1) Listen for the caller (record until silence)
         transcript = stt.record_and_transcribe()
         if not transcript:
-            print("[Simulator] No speech detected. Waiting again...")
+            print("[Simulator] No speech detected. Listening again...")
             continue
 
         print(f"Caller (STT): {transcript}")
-        session.add_message("user", transcript)
 
         lowered = transcript.lower().strip()
-
-        # Fast-path: user explicitly ends the call verbally
         if lowered in ("bye", "goodbye", "thanks, bye", "thank you, bye"):
-            # Log user goodbye
             add_call_message(
                 call_id=call_id,
                 turn_index=turn_index,
@@ -120,30 +128,18 @@ def run_voice_call() -> None:
             )
             break
 
-        # 2) NLU + dialog: get reply + intent/entities
         reply, nlu = dialog.handle_user_utterance(session, transcript)
-
-        # Extract a couple of common fields from entities (optional, for future use)
         entities = nlu.entities or {}
-        service_name = entities.get("service")
-        amount = entities.get("amount")
-        currency = entities.get("currency")
-        sentiment = entities.get("sentiment")
 
-        # Make sure amount is numeric if it's something usable
-        amount_value = None
-        if isinstance(amount, (int, float)):
-            amount_value = float(amount)
-        elif isinstance(amount, str):
-            # very light parsing safeguard, e.g. "49.99" -> 49.99
-            try:
-                amount_value = float(amount)
-            except ValueError:
-                amount_value = None
+        # Extract analytics fields
+        service_name = _normalize_unspecified(entities.get("service"))
+        amount = _safe_float(_normalize_unspecified(entities.get("price_estimated") or entities.get("amount")))
+        currency = _normalize_unspecified(entities.get("currency"))
+        sentiment = _normalize_unspecified(entities.get("sentiment"))
 
         entities_json = json.dumps(entities, ensure_ascii=False)
 
-        # 3) Log user message with NLU entities
+        # Log user message with extraction fields
         add_call_message(
             call_id=call_id,
             turn_index=turn_index,
@@ -153,24 +149,80 @@ def run_voice_call() -> None:
             entities_json=entities_json,
             timestamp=datetime.utcnow(),
             service_name=service_name if isinstance(service_name, str) else None,
-            amount=amount_value,
+            amount=amount,
             currency=currency if isinstance(currency, str) else None,
             sentiment=sentiment if isinstance(sentiment, str) else None,
         )
 
-        # Debug
-        try:
-            conf_str = f"{nlu.confidence:.2f}"
-        except Exception:
-            conf_str = str(nlu.confidence)
+        # If we captured phone, create/attach customer now (so appointments can link)
+        customer_id = None
+        if session.customer_phone:
+            customer_id = get_or_create_customer(
+                business_id=business_id,
+                phone=session.customer_phone,
+                name=session.customer_name,
+            )
+            update_call_customer(call_id=call_id, customer_id=customer_id)
 
-        print(f"[Intent: {nlu.intent} (conf={conf_str})]")
+        # ---- Booking capture logic ----
+        # We create a PENDING appointment when enough fields exist.
+        # Then, if user confirms, we update it to CONFIRMED.
+        booking_type = _normalize_unspecified(entities.get("booking_type"))
+        preferred_staff = _normalize_unspecified(entities.get("preferred_staff"))
+        date = _normalize_unspecified(entities.get("date"))
+        time = _normalize_unspecified(entities.get("time"))
+        confirmation = _normalize_unspecified(entities.get("confirmation"))
+
+        # Infer booking_type from intent if model didn’t provide it
+        if not booking_type:
+            if nlu.intent == "schedule_appointment":
+                booking_type = "NEW"
+            elif nlu.intent == "reschedule_appointment":
+                booking_type = "RESCHEDULE"
+            elif nlu.intent == "cancel_appointment":
+                booking_type = "CANCELLATION"
+
+        # Create / update appointment
+        if customer_id and isinstance(service_name, str) and isinstance(date, str) and isinstance(time, str):
+            if session.appointment_id is None and nlu.intent in ("schedule_appointment", "reschedule_appointment"):
+                session.appointment_id = create_appointment(
+                    business_id=business_id,
+                    customer_id=customer_id,
+                    call_id=call_id,
+                    service_name=service_name,
+                    appointment_date=date,
+                    appointment_time=time,
+                    booking_type=booking_type,
+                    channel="phone",
+                    price_estimated=amount,
+                    currency=currency if isinstance(currency, str) else None,
+                    preferred_staff=preferred_staff if isinstance(preferred_staff, str) else None,
+                    notes=None,
+                    status="PENDING",
+                    source="assistant",
+                    service_code=None,
+                )
+            elif session.appointment_id is not None:
+                update_appointment(
+                    session.appointment_id,
+                    service_name=service_name,
+                    appointment_date=date,
+                    appointment_time=time,
+                    booking_type=booking_type,
+                    price_estimated=amount if amount is not None else None,
+                    currency=currency if isinstance(currency, str) else None,
+                    preferred_staff=preferred_staff if isinstance(preferred_staff, str) else None,
+                )
+
+            # Confirm if the user confirmed
+            if session.appointment_id is not None and isinstance(confirmation, str) and confirmation == "yes":
+                update_appointment(session.appointment_id, status="CONFIRMED")
+
+        # ---- Speak + log assistant reply ----
+        print(f"[Intent: {nlu.intent} (conf={nlu.confidence:.2f})]")
         print(f"Agent: {reply}")
-
-        # 4) Speak agent reply
         tts.speak(reply)
 
-        # 5) Log assistant reply
         turn_index += 1
         add_call_message(
             call_id=call_id,
@@ -182,43 +234,25 @@ def run_voice_call() -> None:
             timestamp=datetime.utcnow(),
         )
 
-        # 6) If NLU says end_call, respect it
         if nlu.intent == "end_call":
             break
 
-        # Prepare index for next user message
         turn_index += 1
-        print("\n[STT] Listening... (you can speak again)")
+        print("\n[STT] Listening...")
 
-    # ---------- End of call: store customer + close call ----------
-    # Attach customer if we captured phone
-    customer_id = None
-    if session.customer_phone:
-        customer_id = get_or_create_customer(
-            business_id=business_id,
-            phone=session.customer_phone,
-            name=session.customer_name,
-        )
-        update_call_customer(call_id=call_id, customer_id=customer_id)
-
-    # Basic end-of-call analytics (you can expand later)
-    started = None
     ended = datetime.utcnow()
     num_turns = len(session.messages)
     total_duration_sec = None
-
-    # Very rough duration if we want: from first to last timestamp
     if session.messages:
         started = session.messages[0].timestamp
-        if started and ended:
-            total_duration_sec = int((ended - started).total_seconds())
+        total_duration_sec = int((ended - started).total_seconds())
 
     end_call(
         call_id=call_id,
         ended_at=ended,
-        outcome=None,              # can set 'BOOKED', 'INFO_ONLY', etc. later
-        primary_intent=None,       # can infer later based on NLU stats per call
-        primary_service=None,      # can infer from service_name mentions / appointments
+        outcome=None,
+        primary_intent=None,
+        primary_service=None,
         total_duration_sec=total_duration_sec,
         num_turns=num_turns,
         total_estimated_value=None,
@@ -230,14 +264,8 @@ def run_voice_call() -> None:
     print(f"Captured phone: {session.customer_phone or 'N/A'}")
     print(f"DB business_id: {business_id}")
     print(f"DB call_id:     {call_id}")
-    if customer_id:
-        print(f"DB customer_id: {customer_id}")
-    else:
-        print("DB customer_id: N/A (no phone captured)")
-
-    print("Transcript:")
-    for msg in session.messages:
-        print(f"[{msg.role}]: {msg.content}")
+    if session.appointment_id:
+        print(f"DB appointment_id: {session.appointment_id}")
 
 
 if __name__ == "__main__":

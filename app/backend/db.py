@@ -1,7 +1,7 @@
 import os
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -17,8 +17,6 @@ MYSQL_USER = os.getenv("MYSQL_USER", "voice_user")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DB = os.getenv("MYSQL_DB", "voice_facilitator")
 
-
-# ---------- CONNECTION & CONTEXT MANAGER ----------
 
 def get_connection() -> pymysql.connections.Connection:
     return pymysql.connect(
@@ -47,15 +45,8 @@ def db_cursor():
         conn.close()
 
 
-# ---------- SCHEMA INITIALIZATION ----------
-
 def init_db() -> None:
-    """
-    Create all tables if they don't exist (MySQL).
-    Schema is designed for analytics + appointments + monetary value.
-    """
     ddl_create = [
-        # Businesses
         """
         CREATE TABLE IF NOT EXISTS businesses (
             id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -66,8 +57,6 @@ def init_db() -> None:
             created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """,
-
-        # Customers
         """
         CREATE TABLE IF NOT EXISTS customers (
             id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -81,14 +70,12 @@ def init_db() -> None:
                 ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """,
-
-        # Services catalog (per business)
         """
         CREATE TABLE IF NOT EXISTS services (
             id                   INT AUTO_INCREMENT PRIMARY KEY,
             business_id          INT NOT NULL,
-            code                 VARCHAR(64) NOT NULL,       -- e.g. HAIRCUT_MEN
-            name                 VARCHAR(255) NOT NULL,      -- e.g. Men's Haircut
+            code                 VARCHAR(64) NOT NULL,
+            name                 VARCHAR(255) NOT NULL,
             default_duration_min INT NULL,
             base_price           DECIMAL(10,2) NULL,
             currency             VARCHAR(16) NULL,
@@ -100,8 +87,6 @@ def init_db() -> None:
             UNIQUE KEY uniq_service_business (business_id, code)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """,
-
-        # Calls (per conversation / session)
         """
         CREATE TABLE IF NOT EXISTS calls (
             id                      INT AUTO_INCREMENT PRIMARY KEY,
@@ -112,14 +97,13 @@ def init_db() -> None:
             ended_at                DATETIME NULL,
             raw_meta                TEXT NULL,
 
-            -- Channel + analytics
-            channel                 VARCHAR(64) NOT NULL DEFAULT 'phone',  -- phone, whatsapp, webchat...
+            channel                 VARCHAR(64) NOT NULL DEFAULT 'phone',
             primary_intent          VARCHAR(255) NULL,
             primary_service         VARCHAR(255) NULL,
-            outcome                 VARCHAR(64)  NULL,          -- BOOKED, INFO_ONLY, ABANDONED, CANCELLED...
-            total_duration_sec      INT NULL,                   -- total call duration
-            num_turns               INT NULL,                   -- number of back-and-forth turns
-            total_estimated_value   DECIMAL(10,2) NULL,         -- sum of service values discussed/confirmed
+            outcome                 VARCHAR(64)  NULL,
+            total_duration_sec      INT NULL,
+            num_turns               INT NULL,
+            total_estimated_value   DECIMAL(10,2) NULL,
 
             CONSTRAINT fk_calls_business
                 FOREIGN KEY (business_id) REFERENCES businesses(id)
@@ -129,23 +113,20 @@ def init_db() -> None:
                 ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """,
-
-        # Call messages (per utterance)
         """
         CREATE TABLE IF NOT EXISTS call_messages (
             id              INT AUTO_INCREMENT PRIMARY KEY,
             call_id         INT NOT NULL,
             turn_index      INT NOT NULL,
-            role            VARCHAR(32) NOT NULL,      -- 'user' or 'assistant'
+            role            VARCHAR(32) NOT NULL,
             text            TEXT NOT NULL,
-            intent          VARCHAR(255) NULL,        -- intent for user turns
+            intent          VARCHAR(255) NULL,
 
-            -- Per-turn extracted info
-            service_name    VARCHAR(255) NULL,        -- identified service mentioned this turn
-            amount          DECIMAL(10,2) NULL,       -- monetary amount mentioned
-            currency        VARCHAR(16) NULL,         -- currency of that amount
-            sentiment       VARCHAR(16) NULL,         -- neutral / frustrated / angry / positive
-            entities_json   TEXT NULL,                -- raw entities blob from NLU
+            service_name    VARCHAR(255) NULL,
+            amount          DECIMAL(10,2) NULL,
+            currency        VARCHAR(16) NULL,
+            sentiment       VARCHAR(16) NULL,
+            entities_json   TEXT NULL,
 
             timestamp       DATETIME NOT NULL,
 
@@ -155,8 +136,6 @@ def init_db() -> None:
             INDEX idx_call_messages_call_id (call_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """,
-
-        # Appointments (actual bookings)
         """
         CREATE TABLE IF NOT EXISTS appointments (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
@@ -164,24 +143,22 @@ def init_db() -> None:
             customer_id         INT NOT NULL,
             call_id             INT NULL,
 
-            -- What was booked
             service_name        VARCHAR(255) NOT NULL,
-            service_code        VARCHAR(64) NULL,     -- optional FK to services.code later
+            service_code        VARCHAR(64) NULL,
 
-            appointment_date    VARCHAR(32) NOT NULL, -- e.g. '2025-12-12'
-            appointment_time    VARCHAR(32) NOT NULL, -- e.g. '16:00' or '4 PM'
+            appointment_date    VARCHAR(32) NOT NULL,
+            appointment_time    VARCHAR(32) NOT NULL,
 
-            -- Booking meta
-            booking_type        VARCHAR(32) NULL,     -- NEW, RESCHEDULE, CANCELLATION
-            channel             VARCHAR(64) NOT NULL DEFAULT 'phone',   -- phone / web / walkin
-            price_estimated     DECIMAL(10,2) NULL,  -- value of the booking
-            currency            VARCHAR(16) NULL,    -- currency of the booking
+            booking_type        VARCHAR(32) NULL,
+            channel             VARCHAR(64) NOT NULL DEFAULT 'phone',
+            price_estimated     DECIMAL(10,2) NULL,
+            currency            VARCHAR(16) NULL,
 
             preferred_staff     VARCHAR(255) NULL,
             notes               TEXT NULL,
 
-            status              VARCHAR(32) NOT NULL DEFAULT 'PENDING', -- PENDING / CONFIRMED / CANCELLED / NO_SHOW...
-            source              VARCHAR(64) NOT NULL DEFAULT 'assistant', -- assistant / human
+            status              VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+            source              VARCHAR(64) NOT NULL DEFAULT 'assistant',
 
             created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -207,23 +184,14 @@ def init_db() -> None:
             cur.execute(ddl)
 
 
-# ---------- BUSINESS / CUSTOMER HELPERS ----------
-
 def get_or_create_business(profile: BusinessProfile, timezone: Optional[str] = None) -> int:
-    """
-    Ensure a row exists in `businesses` for the current profile.
-    Returns business_id.
-    """
     external_id = profile.id
     name = profile.name
     btype = profile.type
     tz = timezone
 
     with db_cursor() as cur:
-        cur.execute(
-            "SELECT id FROM businesses WHERE external_id = %s",
-            (external_id,),
-        )
+        cur.execute("SELECT id FROM businesses WHERE external_id = %s", (external_id,))
         row = cur.fetchone()
         if row:
             return row["id"]
@@ -238,39 +206,24 @@ def get_or_create_business(profile: BusinessProfile, timezone: Optional[str] = N
         return cur.lastrowid
 
 
-def get_or_create_customer(
-    business_id: int,
-    phone: str,
-    name: Optional[str] = None,
-) -> int:
-    """
-    Find or create a customer for (business_id, phone).
-    """
+def get_or_create_customer(business_id: int, phone: str, name: Optional[str] = None) -> int:
     with db_cursor() as cur:
         cur.execute(
-            "SELECT id FROM customers WHERE business_id = %s AND phone = %s",
+            "SELECT id, name FROM customers WHERE business_id = %s AND phone = %s",
             (business_id, phone),
         )
         row = cur.fetchone()
         if row:
-            if name:
-                cur.execute(
-                    "UPDATE customers SET name = COALESCE(%s, name) WHERE id = %s",
-                    (name, row["id"]),
-                )
+            if name and (row.get("name") is None or row.get("name") == ""):
+                cur.execute("UPDATE customers SET name = %s WHERE id = %s", (name, row["id"]))
             return row["id"]
 
         cur.execute(
-            """
-            INSERT INTO customers (business_id, name, phone)
-            VALUES (%s, %s, %s)
-            """,
+            "INSERT INTO customers (business_id, name, phone) VALUES (%s, %s, %s)",
             (business_id, name, phone),
         )
         return cur.lastrowid
 
-
-# ---------- CALL HELPERS ----------
 
 def create_call(
     session_id: str,
@@ -280,26 +233,56 @@ def create_call(
     raw_meta: Optional[str] = None,
     channel: str = "phone",
 ) -> int:
-    """
-    Create a call row and return call_id.
-    """
     if started_at is None:
         started_at = datetime.utcnow()
 
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO calls (
-                session_id,
-                business_id,
-                customer_id,
-                started_at,
-                raw_meta,
-                channel
-            )
+            INSERT INTO calls (session_id, business_id, customer_id, started_at, raw_meta, channel)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             (session_id, business_id, customer_id, started_at, raw_meta, channel),
+        )
+        return cur.lastrowid
+
+
+def update_call_customer(call_id: int, customer_id: int) -> None:
+    with db_cursor() as cur:
+        cur.execute("UPDATE calls SET customer_id = %s WHERE id = %s", (customer_id, call_id))
+
+
+def add_call_message(
+    call_id: int,
+    turn_index: int,
+    role: str,
+    text: str,
+    intent: Optional[str],
+    entities_json: Optional[str],
+    timestamp: Optional[datetime] = None,
+    service_name: Optional[str] = None,
+    amount: Optional[float] = None,
+    currency: Optional[str] = None,
+    sentiment: Optional[str] = None,
+) -> int:
+    if timestamp is None:
+        timestamp = datetime.utcnow()
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO call_messages (
+                call_id, turn_index, role, text, intent,
+                service_name, amount, currency, sentiment,
+                entities_json, timestamp
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                call_id, turn_index, role, text, intent,
+                service_name, amount, currency, sentiment,
+                entities_json, timestamp
+            ),
         )
         return cur.lastrowid
 
@@ -314,9 +297,6 @@ def end_call(
     num_turns: Optional[int] = None,
     total_estimated_value: Optional[float] = None,
 ) -> None:
-    """
-    Update the call row at the end with analytics fields.
-    """
     if ended_at is None:
         ended_at = datetime.utcnow()
 
@@ -346,79 +326,8 @@ def end_call(
     set_clause = ", ".join(fields)
 
     with db_cursor() as cur:
-        cur.execute(
-            f"UPDATE calls SET {set_clause} WHERE id = %s",
-            tuple(params),
-        )
+        cur.execute(f"UPDATE calls SET {set_clause} WHERE id = %s", tuple(params))
 
-
-def update_call_customer(call_id: int, customer_id: int) -> None:
-    """
-    Attach the resolved customer_id to a call (once we know them).
-    """
-    with db_cursor() as cur:
-        cur.execute(
-            "UPDATE calls SET customer_id = %s WHERE id = %s",
-            (customer_id, call_id),
-        )
-
-
-def add_call_message(
-    call_id: int,
-    turn_index: int,
-    role: str,
-    text: str,
-    intent: Optional[str],
-    entities_json: Optional[str],
-    timestamp: Optional[datetime] = None,
-    service_name: Optional[str] = None,
-    amount: Optional[float] = None,
-    currency: Optional[str] = None,
-    sentiment: Optional[str] = None,
-) -> int:
-    """
-    Insert a message (user/assistant turn) into call_messages.
-    Optional fields can be filled from NLU entities when available.
-    """
-    if timestamp is None:
-        timestamp = datetime.utcnow()
-
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO call_messages (
-                call_id,
-                turn_index,
-                role,
-                text,
-                intent,
-                service_name,
-                amount,
-                currency,
-                sentiment,
-                entities_json,
-                timestamp
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                call_id,
-                turn_index,
-                role,
-                text,
-                intent,
-                service_name,
-                amount,
-                currency,
-                sentiment,
-                entities_json,
-                timestamp,
-            ),
-        )
-        return cur.lastrowid
-
-
-# ---------- APPOINTMENTS ----------
 
 def create_appointment(
     business_id: int,
@@ -426,83 +335,99 @@ def create_appointment(
     service_name: str,
     appointment_date: str,
     appointment_time: str,
-    booking_type: Optional[str] = None,          # NEW / RESCHEDULE / CANCELLATION
+    booking_type: Optional[str] = None,
     channel: str = "phone",
     price_estimated: Optional[float] = None,
     currency: Optional[str] = None,
     preferred_staff: Optional[str] = None,
     notes: Optional[str] = None,
     status: str = "PENDING",
-    source: str = "assistant",                   # assistant / human
+    source: str = "assistant",
     call_id: Optional[int] = None,
-    service_code: Optional[str] = None,          # optional normalized code
+    service_code: Optional[str] = None,
 ) -> int:
-    """
-    Create an appointment row.
-    """
     now = datetime.utcnow()
-
     with db_cursor() as cur:
         cur.execute(
             """
             INSERT INTO appointments (
-                business_id,
-                customer_id,
-                call_id,
-                service_name,
-                service_code,
-                appointment_date,
-                appointment_time,
-                booking_type,
-                channel,
-                price_estimated,
-                currency,
-                preferred_staff,
-                notes,
-                status,
-                source,
-                created_at,
-                updated_at
+                business_id, customer_id, call_id,
+                service_name, service_code,
+                appointment_date, appointment_time,
+                booking_type, channel, price_estimated, currency,
+                preferred_staff, notes, status, source, created_at, updated_at
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                business_id,
-                customer_id,
-                call_id,
-                service_name,
-                service_code,
-                appointment_date,
-                appointment_time,
-                booking_type,
-                channel,
-                price_estimated,
-                currency,
-                preferred_staff,
-                notes,
-                status,
-                source,
-                now,
-                now,
+                business_id, customer_id, call_id,
+                service_name, service_code,
+                appointment_date, appointment_time,
+                booking_type, channel, price_estimated, currency,
+                preferred_staff, notes, status, source, now, now
             ),
         )
         return cur.lastrowid
 
 
-def list_appointments_for_business(
-    business_id: int,
-) -> List[Dict[str, Any]]:
-    """
-    Simple query: get all appointments for a business.
-    """
+def update_appointment(
+    appointment_id: int,
+    *,
+    service_name: Optional[str] = None,
+    appointment_date: Optional[str] = None,
+    appointment_time: Optional[str] = None,
+    booking_type: Optional[str] = None,
+    price_estimated: Optional[float] = None,
+    currency: Optional[str] = None,
+    preferred_staff: Optional[str] = None,
+    notes: Optional[str] = None,
+    status: Optional[str] = None,
+) -> None:
+    fields = []
+    params: List[Any] = []
+
+    if service_name is not None:
+        fields.append("service_name = %s")
+        params.append(service_name)
+    if appointment_date is not None:
+        fields.append("appointment_date = %s")
+        params.append(appointment_date)
+    if appointment_time is not None:
+        fields.append("appointment_time = %s")
+        params.append(appointment_time)
+    if booking_type is not None:
+        fields.append("booking_type = %s")
+        params.append(booking_type)
+    if price_estimated is not None:
+        fields.append("price_estimated = %s")
+        params.append(price_estimated)
+    if currency is not None:
+        fields.append("currency = %s")
+        params.append(currency)
+    if preferred_staff is not None:
+        fields.append("preferred_staff = %s")
+        params.append(preferred_staff)
+    if notes is not None:
+        fields.append("notes = %s")
+        params.append(notes)
+    if status is not None:
+        fields.append("status = %s")
+        params.append(status)
+
+    if not fields:
+        return
+
+    set_clause = ", ".join(fields)
+    params.append(appointment_id)
+
+    with db_cursor() as cur:
+        cur.execute(f"UPDATE appointments SET {set_clause} WHERE id = %s", tuple(params))
+
+
+def list_appointments_for_business(business_id: int) -> List[Dict[str, Any]]:
     with db_cursor() as cur:
         cur.execute(
-            """
-            SELECT *
-            FROM appointments
-            WHERE business_id = %s
-            ORDER BY appointment_date, appointment_time
-            """,
+            "SELECT * FROM appointments WHERE business_id = %s ORDER BY appointment_date, appointment_time",
             (business_id,),
         )
         return cur.fetchall()
