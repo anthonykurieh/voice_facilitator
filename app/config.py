@@ -50,11 +50,11 @@ DIALOG_MODEL = "gpt-4o-mini"
 # ============================================================
 # DATABASE (MYSQL)
 # ============================================================
-DB_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-DB_USER = os.getenv("MYSQL_USER", "root")
-DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-DB_NAME = os.getenv("MYSQL_DB", "voice_facilitator")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DB = os.getenv("MYSQL_DB", "voice_facilitator")
 
 # ============================================================
 # SYSTEM BEHAVIOR
