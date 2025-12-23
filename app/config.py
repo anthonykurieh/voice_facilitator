@@ -7,39 +7,24 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env")
 
-# Audio
+# ---- App timezone (used for "today/tomorrow/next monday") ----
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Beirut")
+
+# ---- Audio config ----
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-# If None -> default input device
-# Set this to the index you see from: python -c "import sounddevice as sd; print(sd.query_devices())"
-INPUT_DEVICE = os.getenv("INPUT_DEVICE")
-INPUT_DEVICE = int(INPUT_DEVICE) if INPUT_DEVICE not in (None, "", "None") else None
+# Record-until-silence settings
+RECORD_MAX_SECONDS = 15          # hard cap per user turn
+FRAME_DURATION_SEC = 0.03        # 30ms frames
+SILENCE_DURATION_SEC = 1.0       # stop after 1s trailing silence
 
-# STT Model
-STT_MODEL = "gpt-4o-mini-transcribe"
+# Energy thresholds (these are "base" bounds; STT calibrates per call)
+ENERGY_FLOOR = 0.010             # minimum start threshold
+ENERGY_CEIL = 0.050              # maximum start threshold
+STOP_THRESHOLD_RATIO = 0.70      # stop threshold = start_thresh * ratio
 
-# --- Voice Activity Detection / Recording behavior ---
-WAIT_FOR_SPEECH_SECONDS = 10.0        # wait longer for user to begin speaking
-RECORD_MAX_SECONDS = 15.0             # hard cap for a turn
-FRAME_DURATION_SEC = 0.03             # 30ms frames
-CALIBRATION_SEC = 0.8                 # longer calibration
-PRE_ROLL_SEC = 0.35                   # keep more audio before speech start (prevents clipping)
-
-MIN_RECORD_SECONDS = 0.45
-SILENCE_DURATION_SEC = 1.0
-
-# Adaptive thresholds
-MIN_START_THRESH = 0.008              # easier to trigger
-MAX_START_THRESH = 0.050
-START_MULTIPLIER = 4.5                # lower => easier start detection
-STOP_MULTIPLIER = 3.0
-
-START_FRAMES_REQUIRED = 4             # fewer consecutive frames needed to start recording
-
-# TTS Model
-TTS_MODEL = "gpt-4o-mini-tts"
-
-# Dialog
-NLU_MODEL = "gpt-4o-mini"
-DIALOG_MODEL = "gpt-4o-mini"
+# ---- Models ----
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+DIALOG_MODEL = os.getenv("DIALOG_MODEL", "gpt-4o-mini")

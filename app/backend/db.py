@@ -1,4 +1,5 @@
 import os
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -6,7 +7,6 @@ from typing import Any, Dict, List, Optional
 import pymysql
 from dotenv import load_dotenv
 
-# Load .env from project root (works when running scripts from repo root)
 load_dotenv()
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
@@ -47,10 +47,6 @@ def db_cursor():
 
 
 def init_db():
-    """
-    Creates tables (idempotent).
-    IMPORTANT: keep FK column types EXACTLY identical to referenced PK type.
-    """
     ddl = """
     CREATE TABLE IF NOT EXISTS businesses (
       id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
@@ -136,8 +132,8 @@ def init_db():
       customer_id BIGINT UNSIGNED NOT NULL,
       staff_id BIGINT UNSIGNED NOT NULL,
       service_id BIGINT UNSIGNED NOT NULL,
-      booking_type VARCHAR(32) NOT NULL DEFAULT 'phone',  -- phone, walkin, web
-      status VARCHAR(32) NOT NULL DEFAULT 'confirmed',    -- confirmed, cancelled, no_show, completed
+      booking_type VARCHAR(32) NOT NULL DEFAULT 'phone',
+      status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
       start_time DATETIME NOT NULL,
       end_time DATETIME NOT NULL,
       quoted_price DECIMAL(10,2) NOT NULL,
@@ -162,44 +158,59 @@ def init_db():
         ON DELETE RESTRICT
     ) ENGINE=InnoDB;
 
+    -- Call/session envelope (so you can do conversational analytics cleanly)
+    CREATE TABLE IF NOT EXISTS calls (
+      id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+      business_id BIGINT UNSIGNED NOT NULL,
+      session_id VARCHAR(64) NOT NULL,
+      customer_id BIGINT UNSIGNED NULL,
+      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ended_at TIMESTAMP NULL,
+      end_reason VARCHAR(64) NULL,
+      INDEX idx_calls_business_time (business_id, started_at),
+      INDEX idx_calls_session (session_id),
+      CONSTRAINT fk_calls_business
+        FOREIGN KEY (business_id) REFERENCES businesses(id)
+        ON DELETE CASCADE,
+      CONSTRAINT fk_calls_customer
+        FOREIGN KEY (customer_id) REFERENCES customers(id)
+        ON DELETE SET NULL
+    ) ENGINE=InnoDB;
+
     CREATE TABLE IF NOT EXISTS conversation_events (
       id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
       business_id BIGINT UNSIGNED NOT NULL,
+      call_id BIGINT UNSIGNED NULL,
       customer_id BIGINT UNSIGNED NULL,
       session_id VARCHAR(64) NOT NULL,
-      role VARCHAR(16) NOT NULL,          -- user/assistant/system
+      role VARCHAR(16) NOT NULL,
       text LONGTEXT NULL,
       intent VARCHAR(64) NULL,
       confidence DECIMAL(5,4) NULL,
       entities_json JSON NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_conv_session (session_id),
+      INDEX idx_conv_call (call_id),
       INDEX idx_conv_business_time (business_id, created_at),
       CONSTRAINT fk_conv_business
         FOREIGN KEY (business_id) REFERENCES businesses(id)
-        ON DELETE CASCADE
-    ) ENGINE=InnoDB;
-
-    CREATE TABLE IF NOT EXISTS calls (
-      id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-      business_id BIGINT UNSIGNED NOT NULL,
-      customer_id BIGINT UNSIGNED NULL,
-      session_id VARCHAR(64) NOT NULL,
-      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      ended_at TIMESTAMP NULL,
-      INDEX idx_calls_session (session_id),
-      INDEX idx_calls_business_time (business_id, started_at),
-      CONSTRAINT fk_calls_business
-        FOREIGN KEY (business_id) REFERENCES businesses(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+      CONSTRAINT fk_conv_call
+        FOREIGN KEY (call_id) REFERENCES calls(id)
+        ON DELETE SET NULL
     ) ENGINE=InnoDB;
     """
+
     with db_cursor() as cur:
         for stmt in ddl.split(";"):
             s = stmt.strip()
             if s:
                 cur.execute(s)
 
+
+# --------------------
+# Core entities
+# --------------------
 
 def ensure_business(slug: str, name: str, timezone: str = "Asia/Beirut") -> int:
     with db_cursor() as cur:
@@ -214,16 +225,7 @@ def ensure_business(slug: str, name: str, timezone: str = "Asia/Beirut") -> int:
         return int(cur.lastrowid)
 
 
-def get_or_create_business(name: str, timezone: str = "Asia/Beirut") -> int:
-    # deterministic slug from name
-    slug = (
-        (name or "business")
-        .strip()
-        .lower()
-        .replace("&", "and")
-        .replace(" ", "_")
-        .replace("-", "_")
-    )
+def get_or_create_business(name: str, slug: str = "barber_demo", timezone: str = "Asia/Beirut") -> int:
     return ensure_business(slug=slug, name=name, timezone=timezone)
 
 
@@ -239,6 +241,7 @@ def upsert_customer(business_id: int, name: str, phone: str) -> int:
         )
         if cur.lastrowid:
             return int(cur.lastrowid)
+
         cur.execute(
             "SELECT id FROM customers WHERE business_id=%s AND phone=%s",
             (business_id, phone),
@@ -249,53 +252,9 @@ def upsert_customer(business_id: int, name: str, phone: str) -> int:
         return int(row["id"])
 
 
-def log_call_start(session_id: str, business_id: int, customer_id: Optional[int] = None) -> int:
-    with db_cursor() as cur:
-        cur.execute(
-            "INSERT INTO calls (business_id, customer_id, session_id) VALUES (%s,%s,%s)",
-            (business_id, customer_id, session_id),
-        )
-        return int(cur.lastrowid)
-
-
-def log_call_end(call_id: int):
-    with db_cursor() as cur:
-        cur.execute("UPDATE calls SET ended_at=NOW() WHERE id=%s", (call_id,))
-
-
-def log_message(
-    call_id: int,
-    role: str,
-    text: str,
-    intent: Optional[str] = None,
-    confidence: Optional[float] = None,
-    entities: Optional[Dict[str, Any]] = None,
-):
-    # Resolve business_id from call (so you never FK-mismatch)
-    with db_cursor() as cur:
-        cur.execute("SELECT business_id, customer_id, session_id FROM calls WHERE id=%s", (call_id,))
-        call = cur.fetchone()
-        if not call:
-            raise RuntimeError(f"log_message: call_id={call_id} not found")
-
-        cur.execute(
-            """
-            INSERT INTO conversation_events
-            (business_id, customer_id, session_id, role, text, intent, confidence, entities_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                call["business_id"],
-                call["customer_id"],
-                call["session_id"],
-                role,
-                text,
-                intent,
-                confidence,
-                (entities if entities is not None else None),
-            ),
-        )
-
+# --------------------
+# Services
+# --------------------
 
 def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional[Dict[str, Any]]:
     s = (service_text or "").strip().lower()
@@ -305,7 +264,7 @@ def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT *
+            SELECT id, code, name, duration_min, price, currency
             FROM services
             WHERE business_id=%s AND active=1
               AND (LOWER(code)=%s OR LOWER(name)=%s OR LOWER(name) LIKE %s)
@@ -324,6 +283,10 @@ def list_services(business_id: int) -> List[Dict[str, Any]]:
         )
         return cur.fetchall()
 
+
+# --------------------
+# Appointments
+# --------------------
 
 def create_appointment(
     business_id: int,
@@ -359,3 +322,88 @@ def create_appointment(
             ),
         )
         return int(cur.lastrowid)
+
+
+# --------------------
+# Call/session logging (what you’re missing)
+# --------------------
+
+def log_call_start(session_id: str, business_id: int, customer_id: Optional[int] = None) -> int:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO calls (business_id, session_id, customer_id)
+            VALUES (%s,%s,%s)
+            """,
+            (business_id, session_id, customer_id),
+        )
+        return int(cur.lastrowid)
+
+
+def log_call_end(call_id: int, end_reason: str = "user_hangup") -> None:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE calls
+            SET ended_at=CURRENT_TIMESTAMP, end_reason=%s
+            WHERE id=%s
+            """,
+            (end_reason, call_id),
+        )
+
+
+def attach_customer_to_call(call_id: int, customer_id: int) -> None:
+    with db_cursor() as cur:
+        cur.execute("UPDATE calls SET customer_id=%s WHERE id=%s", (customer_id, call_id))
+
+
+def log_message(
+    call_id: int,
+    role: str,
+    text: Optional[str],
+    *,
+    business_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    customer_id: Optional[int] = None,
+    intent: Optional[str] = None,
+    confidence: Optional[float] = None,
+    entities: Optional[Dict[str, Any]] = None,
+):
+    """
+    This signature matches your simulate_voice_call usage:
+      log_message(call_id, "assistant", "...", intent=..., confidence=..., entities=...)
+
+    We auto-derive business_id/session_id from calls if not provided.
+    """
+    entities_json = json.dumps(entities, ensure_ascii=False) if entities is not None else None
+
+    with db_cursor() as cur:
+        if business_id is None or session_id is None:
+            cur.execute("SELECT business_id, session_id, customer_id FROM calls WHERE id=%s", (call_id,))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError(f"log_message: call_id {call_id} not found.")
+            business_id = business_id or int(row["business_id"])
+            session_id = session_id or str(row["session_id"])
+            if customer_id is None:
+                customer_id = row["customer_id"]
+
+        cur.execute(
+            """
+            INSERT INTO conversation_events
+              (business_id, call_id, customer_id, session_id, role, text, intent, confidence, entities_json)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+            """,
+            (
+                business_id,
+                call_id,
+                customer_id,
+                session_id,
+                role,
+                text,
+                intent,
+                confidence,
+                entities_json,
+            ),
+        )

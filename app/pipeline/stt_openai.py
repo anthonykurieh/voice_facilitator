@@ -2,8 +2,8 @@ import io
 import queue
 import sys
 import threading
-from collections import deque
-from typing import Deque, List
+from dataclasses import dataclass
+from typing import Optional, List
 
 import numpy as np
 import sounddevice as sd
@@ -13,35 +13,36 @@ from app.pipeline.openai_client import client
 from app.config import (
     SAMPLE_RATE,
     CHANNELS,
-    INPUT_DEVICE,
     RECORD_MAX_SECONDS,
-    STT_MODEL,
-    WAIT_FOR_SPEECH_SECONDS,
     FRAME_DURATION_SEC,
-    CALIBRATION_SEC,
-    PRE_ROLL_SEC,
-    MIN_RECORD_SECONDS,
-    SILENCE_DURATION_SEC,
-    MIN_START_THRESH,
-    MAX_START_THRESH,
-    START_MULTIPLIER,
-    STOP_MULTIPLIER,
-    START_FRAMES_REQUIRED,
+    STT_MODEL,
 )
 
 
+@dataclass
+class VadConfig:
+    # How long to listen for the *start* of speech
+    max_wait_seconds: float = 6.0
+
+    # Trailing silence required to stop recording
+    silence_seconds: float = 1.0
+
+    # Pre-buffer so we don’t clip the first syllable
+    prebuffer_seconds: float = 0.4
+
+    # Dynamic threshold controls
+    # start_thresh = max(min_start, noise_rms * start_mult)
+    # stop_thresh  = max(min_stop,  noise_rms * stop_mult)
+    start_mult: float = 3.0
+    stop_mult: float = 2.0
+    min_start: float = 0.010
+    min_stop: float = 0.012
+
+
 class OpenAISTT:
-    def __init__(self, model: str = STT_MODEL):
+    def __init__(self, model: str = STT_MODEL, vad: Optional[VadConfig] = None):
         self.model = model
-
-    @staticmethod
-    def _rms(frame: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(np.square(frame))))
-
-    @staticmethod
-    def _is_dead(frame: np.ndarray) -> bool:
-        # if mic is muted / permissions / wrong device, frames can be near-zero
-        return float(np.max(np.abs(frame))) < 1e-4
+        self.vad = vad or VadConfig()
 
     def _audio_to_wav_bytes(self, audio: np.ndarray) -> bytes:
         buf = io.BytesIO()
@@ -49,157 +50,122 @@ class OpenAISTT:
         buf.seek(0)
         return buf.read()
 
+    def _rms(self, frame: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(np.square(frame))))
+
     def _record_until_silence(self) -> np.ndarray:
         print("[STT] Listening... speak when ready.")
 
+        frame_samples = int(SAMPLE_RATE * FRAME_DURATION_SEC)
+        silence_frames_required = int(self.vad.silence_seconds / FRAME_DURATION_SEC)
+        max_frames_total = int(RECORD_MAX_SECONDS / FRAME_DURATION_SEC)
+        max_wait_frames = int(self.vad.max_wait_seconds / FRAME_DURATION_SEC)
+
+        # prebuffer (ring buffer)
+        prebuffer_frames = max(1, int(self.vad.prebuffer_seconds / FRAME_DURATION_SEC))
+        prebuf: List[np.ndarray] = []
+
         audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         stop_event = threading.Event()
-
-        frame_samples = int(SAMPLE_RATE * FRAME_DURATION_SEC)
-        max_frames = int(RECORD_MAX_SECONDS / FRAME_DURATION_SEC)
-        min_frames = int(MIN_RECORD_SECONDS / FRAME_DURATION_SEC)
-        silence_frames_required = int(SILENCE_DURATION_SEC / FRAME_DURATION_SEC)
-
-        pre_roll_frames = max(1, int(PRE_ROLL_SEC / FRAME_DURATION_SEC))
-        pre_roll: Deque[np.ndarray] = deque(maxlen=pre_roll_frames)
-
-        state = {
-            "frames": [],
-            "recording": False,
-            "speech_hits": 0,
-            "silence_hits": 0,
-            "total_frames": 0,
-            "dead_frames": 0,
-        }
 
         def callback(indata, frames, time_info, status):
             if status:
                 print(f"[STT] Recording status: {status}", file=sys.stderr)
             if stop_event.is_set():
                 return
-            data = indata.copy().reshape(-1).astype("float32")
-            audio_queue.put(data)
+            # mono float32
+            data = indata.copy()
+            if data.ndim > 1:
+                data = data.mean(axis=1, keepdims=True)
+            audio_queue.put(data.astype("float32"))
 
-        stream_kwargs = dict(
+        # 1) Calibrate noise for ~0.5s
+        noise_frames = []
+        calibrate_frames = max(1, int(0.5 / FRAME_DURATION_SEC))
+
+        with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
             blocksize=frame_samples,
             callback=callback,
-        )
-        if INPUT_DEVICE is not None:
-            stream_kwargs["device"] = INPUT_DEVICE
-
-        with sd.InputStream(**stream_kwargs):
-            # ---- Flush any buffered audio (esp. after TTS playback) ----
-            flush_until = int(0.25 / FRAME_DURATION_SEC)  # 250ms flush
-            for _ in range(flush_until):
-                try:
-                    audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-            # ---- Calibration: estimate noise floor robustly ----
-            calib_frames = max(1, int(CALIBRATION_SEC / FRAME_DURATION_SEC))
-            noise_vals: List[float] = []
-            for _ in range(calib_frames):
+        ):
+            for _ in range(calibrate_frames):
                 try:
                     f = audio_queue.get(timeout=1.0)
+                    noise_frames.append(self._rms(f))
                 except queue.Empty:
-                    continue
-                if self._is_dead(f):
-                    state["dead_frames"] += 1
-                    continue
-                r = self._rms(f)
-                # ignore accidental speech spikes
-                if r < 0.20:
-                    noise_vals.append(r)
+                    pass
 
-            if state["dead_frames"] >= int(calib_frames * 0.7):
-                print("[STT] ⚠️ Microphone looks silent (dead frames). Wrong device or mic permission issue.")
-                return np.zeros(0, dtype="float32")
+            noise_rms = float(np.median(noise_frames)) if noise_frames else 0.002
 
-            noise_rms = float(np.median(noise_vals)) if noise_vals else 0.002
-
-            start_thresh = max(MIN_START_THRESH, min(MAX_START_THRESH, noise_rms * START_MULTIPLIER))
-            stop_thresh = max(MIN_START_THRESH, min(MAX_START_THRESH, noise_rms * STOP_MULTIPLIER))
+            start_thresh = max(self.vad.min_start, noise_rms * self.vad.start_mult)
+            stop_thresh = max(self.vad.min_stop, noise_rms * self.vad.stop_mult)
 
             print(
                 f"[STT] Calibrated noise_rms={noise_rms:.5f} "
                 f"start_thresh={start_thresh:.5f} stop_thresh={stop_thresh:.5f} "
-                f"(start_frames={START_FRAMES_REQUIRED}, silence_frames_required={silence_frames_required})"
+                f"(silence_frames_required={silence_frames_required})"
             )
 
-            # ---- Wait for speech start ----
-            wait_frames = int(WAIT_FOR_SPEECH_SECONDS / FRAME_DURATION_SEC)
-            for _ in range(wait_frames):
-                try:
-                    f = audio_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
+            frames: List[np.ndarray] = []
+            speaking = False
+            silence_count = 0
+            waited = 0
 
-                if self._is_dead(f):
-                    state["dead_frames"] += 1
-                    continue
-
-                pre_roll.append(f)
-                r = self._rms(f)
-
-                if r >= start_thresh:
-                    state["speech_hits"] += 1
-                else:
-                    state["speech_hits"] = 0
-
-                if state["speech_hits"] >= START_FRAMES_REQUIRED:
-                    state["recording"] = True
-                    state["frames"].extend(list(pre_roll))
-                    print("[STT] Speech detected, recording started.")
-                    break
-
-            if not state["recording"]:
-                print("[STT] Reached max wait time, no speech detected.")
-                return np.zeros(0, dtype="float32")
-
-            # ---- Record until trailing silence or hard cap ----
             while True:
                 try:
-                    f = audio_queue.get(timeout=1.0)
+                    frame = audio_queue.get(timeout=RECORD_MAX_SECONDS)
                 except queue.Empty:
                     break
 
-                if self._is_dead(f):
-                    state["dead_frames"] += 1
-                    # if device dies mid-recording, break early
-                    if state["dead_frames"] > 50:
-                        print("[STT] ⚠️ Microphone became silent mid-recording.")
+                r = self._rms(frame)
+
+                # maintain prebuffer always
+                prebuf.append(frame)
+                if len(prebuf) > prebuffer_frames:
+                    prebuf.pop(0)
+
+                if not speaking:
+                    waited += 1
+                    if r >= start_thresh:
+                        speaking = True
+                        frames.extend(prebuf)  # include the lead-in
+                        prebuf = []
+                        silence_count = 0
+                        print("[STT] Speech detected, recording started.")
+                    elif waited >= max_wait_frames:
+                        print("[STT] No speech detected (timeout).")
+                        stop_event.set()
                         break
                     continue
 
-                state["frames"].append(f)
-                state["total_frames"] += 1
+                # speaking
+                frames.append(frame)
 
-                r = self._rms(f)
+                if r < stop_thresh:
+                    silence_count += 1
+                else:
+                    silence_count = 0
 
-                if state["total_frames"] >= min_frames:
-                    if r < stop_thresh:
-                        state["silence_hits"] += 1
-                    else:
-                        state["silence_hits"] = 0
-
-                    if state["silence_hits"] >= silence_frames_required:
-                        print("[STT] Detected pause, stopping.")
-                        break
-
-                if state["total_frames"] >= max_frames:
-                    print("[STT] Reached max duration, stopping.")
+                if silence_count >= silence_frames_required:
+                    print("[STT] Detected pause in speech, stopping recording.")
+                    stop_event.set()
                     break
 
-            stop_event.set()
+                if len(frames) >= max_frames_total:
+                    print("[STT] Reached maximum recording duration, stopping.")
+                    stop_event.set()
+                    break
 
-        if not state["frames"]:
+        if not frames:
             return np.zeros(0, dtype="float32")
 
-        return np.concatenate(state["frames"]).astype("float32")
+        audio = np.concatenate(frames, axis=0)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        return audio.astype("float32")
 
     def record_and_transcribe(self) -> str:
         audio = self._record_until_silence()
@@ -208,8 +174,8 @@ class OpenAISTT:
             return ""
 
         wav_bytes = self._audio_to_wav_bytes(audio)
-        print("[STT] Sending audio to OpenAI STT...")
 
+        print("[STT] Sending audio to OpenAI STT...")
         buf = io.BytesIO(wav_bytes)
         buf.name = "input.wav"
 
@@ -217,7 +183,6 @@ class OpenAISTT:
             model=self.model,
             file=buf,
         )
-
         text = transcription.text.strip()
         print(f"[STT] Transcription: {text}")
         return text

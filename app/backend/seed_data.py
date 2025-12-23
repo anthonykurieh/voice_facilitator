@@ -1,6 +1,5 @@
 from app.backend.db import ensure_business, db_cursor
 
-
 def seed_barber_business() -> int:
     business_id = ensure_business(slug="barber_demo", name="Downtown Barber Shop", timezone="Asia/Beirut")
 
@@ -58,18 +57,12 @@ def seed_barber_business() -> int:
             )
 
         # specials
-        cur.execute(
-            "INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
-            (business_id, staff["omar"], services["fade"]),
-        )
-        cur.execute(
-            "INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
-            (business_id, staff["rami"], services["beard"]),
-        )
-        cur.execute(
-            "INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
-            (business_id, staff["karim"], services["combo"]),
-        )
+        cur.execute("INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
+                    (business_id, staff["omar"], services["fade"]))
+        cur.execute("INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
+                    (business_id, staff["rami"], services["beard"]))
+        cur.execute("INSERT INTO staff_services (business_id, staff_id, service_id) VALUES (%s,%s,%s)",
+                    (business_id, staff["karim"], services["combo"]))
 
     return business_id
 
