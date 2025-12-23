@@ -7,57 +7,39 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment or .env")
 
-# ============================================================
-# AUDIO CONFIG
-# ============================================================
+# Audio
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-# Frame-based recording
-FRAME_DURATION_SEC = 0.03  # 30ms frames
+# If None -> default input device
+# Set this to the index you see from: python -c "import sounddevice as sd; print(sd.query_devices())"
+INPUT_DEVICE = os.getenv("INPUT_DEVICE")
+INPUT_DEVICE = int(INPUT_DEVICE) if INPUT_DEVICE not in (None, "", "None") else None
 
-# ============================================================
-# RECORDING LIMITS
-# ============================================================
-RECORD_MAX_SECONDS = 15
+# STT Model
+STT_MODEL = "gpt-4o-mini-transcribe"
 
-# Legacy fallback
-SILENCE_THRESHOLD = 0.015
+# --- Voice Activity Detection / Recording behavior ---
+WAIT_FOR_SPEECH_SECONDS = 10.0        # wait longer for user to begin speaking
+RECORD_MAX_SECONDS = 15.0             # hard cap for a turn
+FRAME_DURATION_SEC = 0.03             # 30ms frames
+CALIBRATION_SEC = 0.8                 # longer calibration
+PRE_ROLL_SEC = 0.35                   # keep more audio before speech start (prevents clipping)
+
+MIN_RECORD_SECONDS = 0.45
 SILENCE_DURATION_SEC = 1.0
 
-# ============================================================
-# ADVANCED VAD (noise robust)
-# ============================================================
-VAD_CALIBRATION_SEC = 0.6
-VAD_START_FRAMES = 6
-VAD_PRE_ROLL_SEC = 0.25
-VAD_MIN_RECORD_SEC = 0.5
+# Adaptive thresholds
+MIN_START_THRESH = 0.008              # easier to trigger
+MAX_START_THRESH = 0.050
+START_MULTIPLIER = 4.5                # lower => easier start detection
+STOP_MULTIPLIER = 3.0
 
-VAD_START_MULTIPLIER = 3.0
-VAD_STOP_MULTIPLIER = 2.0
+START_FRAMES_REQUIRED = 4             # fewer consecutive frames needed to start recording
 
-VAD_ABS_START_FLOOR = 0.012
-VAD_ABS_STOP_FLOOR = 0.010
-
-# ============================================================
-# OPENAI MODELS (cheap baseline)
-# ============================================================
-STT_MODEL = "gpt-4o-mini-transcribe"
+# TTS Model
 TTS_MODEL = "gpt-4o-mini-tts"
+
+# Dialog
 NLU_MODEL = "gpt-4o-mini"
 DIALOG_MODEL = "gpt-4o-mini"
-
-# ============================================================
-# DATABASE (MYSQL)
-# ============================================================
-MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-MYSQL_DB = os.getenv("MYSQL_DB", "voice_facilitator")
-
-# ============================================================
-# SYSTEM BEHAVIOR
-# ============================================================
-INTENT_CONFIDENCE_FALLBACK = 0.4
-DEBUG_MODE = True

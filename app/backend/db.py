@@ -1,32 +1,13 @@
 import os
 from contextlib import contextmanager
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pymysql
 from dotenv import load_dotenv
 
-
-# ----------------------------
-# Robust .env loading
-# ----------------------------
-def _find_project_root(start: Path) -> Path:
-    cur = start
-    for _ in range(10):
-        if (cur / ".env").exists():
-            return cur
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-    return start
-
-
-_THIS_FILE = Path(__file__).resolve()
-_PROJECT_ROOT = _find_project_root(_THIS_FILE.parent)
-_ENV_PATH = _PROJECT_ROOT / ".env"
-load_dotenv(dotenv_path=_ENV_PATH, override=False)
-
+# Load .env from project root (works when running scripts from repo root)
+load_dotenv()
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
@@ -37,7 +18,7 @@ DB_NAME = os.getenv("DB_NAME", "voice_facilitator")
 
 def get_connection():
     if not DB_NAME:
-        raise RuntimeError("DB_NAME is not set. Set DB_NAME=voice_facilitator in .env")
+        raise RuntimeError("DB_NAME is not set. Set it in .env (DB_NAME=voice_facilitator).")
 
     return pymysql.connect(
         host=DB_HOST,
@@ -65,16 +46,17 @@ def db_cursor():
         conn.close()
 
 
-# ----------------------------
-# Schema (idempotent)
-# ----------------------------
 def init_db():
+    """
+    Creates tables (idempotent).
+    IMPORTANT: keep FK column types EXACTLY identical to referenced PK type.
+    """
     ddl = """
     CREATE TABLE IF NOT EXISTS businesses (
       id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
       slug VARCHAR(64) NOT NULL UNIQUE,
       name VARCHAR(255) NOT NULL,
-      timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Dubai',
+      timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Beirut',
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB;
 
@@ -138,7 +120,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS business_hours (
       id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
       business_id BIGINT UNSIGNED NOT NULL,
-      dow TINYINT NOT NULL,
+      dow TINYINT NOT NULL,                 -- 0=Mon ... 6=Sun
       open_time TIME NOT NULL,
       close_time TIME NOT NULL,
       is_closed TINYINT NOT NULL DEFAULT 0,
@@ -154,16 +136,18 @@ def init_db():
       customer_id BIGINT UNSIGNED NOT NULL,
       staff_id BIGINT UNSIGNED NOT NULL,
       service_id BIGINT UNSIGNED NOT NULL,
-      booking_type VARCHAR(32) NOT NULL DEFAULT 'phone',
-      status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+      booking_type VARCHAR(32) NOT NULL DEFAULT 'phone',  -- phone, walkin, web
+      status VARCHAR(32) NOT NULL DEFAULT 'confirmed',    -- confirmed, cancelled, no_show, completed
       start_time DATETIME NOT NULL,
       end_time DATETIME NOT NULL,
       quoted_price DECIMAL(10,2) NOT NULL,
       currency VARCHAR(8) NOT NULL,
       notes TEXT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
       INDEX idx_appt_business_time (business_id, start_time),
       INDEX idx_appt_staff_time (staff_id, start_time),
+
       CONSTRAINT fk_appt_business
         FOREIGN KEY (business_id) REFERENCES businesses(id)
         ON DELETE CASCADE,
@@ -178,26 +162,12 @@ def init_db():
         ON DELETE RESTRICT
     ) ENGINE=InnoDB;
 
-    CREATE TABLE IF NOT EXISTS calls (
-      id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-      business_id BIGINT UNSIGNED NOT NULL,
-      session_id VARCHAR(64) NOT NULL,
-      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      ended_at TIMESTAMP NULL,
-      INDEX idx_calls_business_time (business_id, started_at),
-      INDEX idx_calls_session (session_id),
-      CONSTRAINT fk_calls_business
-        FOREIGN KEY (business_id) REFERENCES businesses(id)
-        ON DELETE CASCADE
-    ) ENGINE=InnoDB;
-
     CREATE TABLE IF NOT EXISTS conversation_events (
       id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
       business_id BIGINT UNSIGNED NOT NULL,
-      call_id BIGINT UNSIGNED NULL,
       customer_id BIGINT UNSIGNED NULL,
       session_id VARCHAR(64) NOT NULL,
-      role VARCHAR(16) NOT NULL,
+      role VARCHAR(16) NOT NULL,          -- user/assistant/system
       text LONGTEXT NULL,
       intent VARCHAR(64) NULL,
       confidence DECIMAL(5,4) NULL,
@@ -205,13 +175,23 @@ def init_db():
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_conv_session (session_id),
       INDEX idx_conv_business_time (business_id, created_at),
-      INDEX idx_conv_call (call_id),
       CONSTRAINT fk_conv_business
         FOREIGN KEY (business_id) REFERENCES businesses(id)
-        ON DELETE CASCADE,
-      CONSTRAINT fk_conv_call
-        FOREIGN KEY (call_id) REFERENCES calls(id)
-        ON DELETE SET NULL
+        ON DELETE CASCADE
+    ) ENGINE=InnoDB;
+
+    CREATE TABLE IF NOT EXISTS calls (
+      id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+      business_id BIGINT UNSIGNED NOT NULL,
+      customer_id BIGINT UNSIGNED NULL,
+      session_id VARCHAR(64) NOT NULL,
+      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ended_at TIMESTAMP NULL,
+      INDEX idx_calls_session (session_id),
+      INDEX idx_calls_business_time (business_id, started_at),
+      CONSTRAINT fk_calls_business
+        FOREIGN KEY (business_id) REFERENCES businesses(id)
+        ON DELETE CASCADE
     ) ENGINE=InnoDB;
     """
     with db_cursor() as cur:
@@ -221,13 +201,7 @@ def init_db():
                 cur.execute(s)
 
 
-# ----------------------------
-# Business helpers
-# ----------------------------
-def ensure_business(slug: str, name: str, timezone: str = "Asia/Dubai") -> int:
-    """
-    Original name expected by seed_data.py.
-    """
+def ensure_business(slug: str, name: str, timezone: str = "Asia/Beirut") -> int:
     with db_cursor() as cur:
         cur.execute("SELECT id FROM businesses WHERE slug=%s", (slug,))
         row = cur.fetchone()
@@ -240,16 +214,19 @@ def ensure_business(slug: str, name: str, timezone: str = "Asia/Dubai") -> int:
         return int(cur.lastrowid)
 
 
-def get_or_create_business(name: str, slug: str = "barber_demo", timezone: str = "Asia/Dubai") -> int:
-    """
-    New name used by simulate_voice_call.py.
-    """
+def get_or_create_business(name: str, timezone: str = "Asia/Beirut") -> int:
+    # deterministic slug from name
+    slug = (
+        (name or "business")
+        .strip()
+        .lower()
+        .replace("&", "and")
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
     return ensure_business(slug=slug, name=name, timezone=timezone)
 
 
-# ----------------------------
-# Customer helpers
-# ----------------------------
 def upsert_customer(business_id: int, name: str, phone: str) -> int:
     with db_cursor() as cur:
         cur.execute(
@@ -262,7 +239,6 @@ def upsert_customer(business_id: int, name: str, phone: str) -> int:
         )
         if cur.lastrowid:
             return int(cur.lastrowid)
-
         cur.execute(
             "SELECT id FROM customers WHERE business_id=%s AND phone=%s",
             (business_id, phone),
@@ -273,9 +249,54 @@ def upsert_customer(business_id: int, name: str, phone: str) -> int:
         return int(row["id"])
 
 
-# ----------------------------
-# Service helpers (needed by availability)
-# ----------------------------
+def log_call_start(session_id: str, business_id: int, customer_id: Optional[int] = None) -> int:
+    with db_cursor() as cur:
+        cur.execute(
+            "INSERT INTO calls (business_id, customer_id, session_id) VALUES (%s,%s,%s)",
+            (business_id, customer_id, session_id),
+        )
+        return int(cur.lastrowid)
+
+
+def log_call_end(call_id: int):
+    with db_cursor() as cur:
+        cur.execute("UPDATE calls SET ended_at=NOW() WHERE id=%s", (call_id,))
+
+
+def log_message(
+    call_id: int,
+    role: str,
+    text: str,
+    intent: Optional[str] = None,
+    confidence: Optional[float] = None,
+    entities: Optional[Dict[str, Any]] = None,
+):
+    # Resolve business_id from call (so you never FK-mismatch)
+    with db_cursor() as cur:
+        cur.execute("SELECT business_id, customer_id, session_id FROM calls WHERE id=%s", (call_id,))
+        call = cur.fetchone()
+        if not call:
+            raise RuntimeError(f"log_message: call_id={call_id} not found")
+
+        cur.execute(
+            """
+            INSERT INTO conversation_events
+            (business_id, customer_id, session_id, role, text, intent, confidence, entities_json)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                call["business_id"],
+                call["customer_id"],
+                call["session_id"],
+                role,
+                text,
+                intent,
+                confidence,
+                (entities if entities is not None else None),
+            ),
+        )
+
+
 def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional[Dict[str, Any]]:
     s = (service_text or "").strip().lower()
     if not s:
@@ -298,88 +319,31 @@ def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional
 def list_services(business_id: int) -> List[Dict[str, Any]]:
     with db_cursor() as cur:
         cur.execute(
-            """
-            SELECT id, code, name, duration_min, price, currency
-            FROM services
-            WHERE business_id=%s AND active=1
-            ORDER BY id
-            """,
+            "SELECT id, code, name, duration_min, price, currency FROM services WHERE business_id=%s AND active=1",
             (business_id,),
         )
         return cur.fetchall()
 
 
-# ----------------------------
-# Calls / logs (minimal baseline)
-# ----------------------------
-def log_call_start(session_id: str, business_id: int) -> int:
-    with db_cursor() as cur:
-        cur.execute(
-            "INSERT INTO calls (business_id, session_id) VALUES (%s,%s)",
-            (business_id, session_id),
-        )
-        return int(cur.lastrowid)
-
-
-def log_call_end(call_id: int) -> None:
-    with db_cursor() as cur:
-        cur.execute("UPDATE calls SET ended_at=CURRENT_TIMESTAMP WHERE id=%s", (call_id,))
-
-
-def log_message(call_id: int, role: str, text: str) -> None:
-    with db_cursor() as cur:
-        cur.execute("SELECT business_id, session_id FROM calls WHERE id=%s", (call_id,))
-        row = cur.fetchone()
-        if not row:
-            raise RuntimeError(f"log_message: call_id {call_id} not found")
-        business_id = int(row["business_id"])
-        session_id = str(row["session_id"])
-
-        cur.execute(
-            """
-            INSERT INTO conversation_events
-              (business_id, call_id, session_id, role, text)
-            VALUES
-              (%s,%s,%s,%s,%s)
-            """,
-            (business_id, call_id, session_id, role, text),
-        )
-
-
-# ----------------------------
-# Appointment creation used by simulator (service_name -> service_id)
-# ----------------------------
 def create_appointment(
-    *,
     business_id: int,
     customer_id: int,
-    service_name: str,
-    booking_type: str,
-    appointment_date: str,   # YYYY-MM-DD
-    appointment_time: str,   # HH:MM
     staff_id: int,
+    service_id: int,
+    booking_type: str,
+    start_time: datetime,
+    end_time: datetime,
+    quoted_price: float,
+    currency: str,
     notes: Optional[str] = None,
 ) -> int:
-    svc = get_service_by_name_or_code(business_id, service_name)
-    if not svc:
-        raise RuntimeError(f"Unknown service '{service_name}' for business_id={business_id}")
-
-    service_id = int(svc["id"])
-    duration_min = int(svc["duration_min"])
-    quoted_price = float(svc["price"])
-    currency = str(svc["currency"])
-
-    start_dt = datetime.fromisoformat(f"{appointment_date}T{appointment_time}:00")
-    end_dt = start_dt + timedelta(minutes=duration_min)
-
     with db_cursor() as cur:
         cur.execute(
             """
             INSERT INTO appointments
-              (business_id, customer_id, staff_id, service_id, booking_type, status,
-               start_time, end_time, quoted_price, currency, notes)
+              (business_id, customer_id, staff_id, service_id, booking_type, start_time, end_time, quoted_price, currency, notes)
             VALUES
-              (%s,%s,%s,%s,%s,'confirmed',%s,%s,%s,%s,%s)
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 business_id,
@@ -387,8 +351,8 @@ def create_appointment(
                 staff_id,
                 service_id,
                 booking_type,
-                start_dt,
-                end_dt,
+                start_time,
+                end_time,
                 quoted_price,
                 currency,
                 notes,

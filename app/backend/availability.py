@@ -1,17 +1,14 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time, date
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app.backend.db import db_cursor, get_service_by_name_or_code
 
 
-# ----------------------------
-# Types / results
-# ----------------------------
 @dataclass
 class AvailabilityResult:
     ok: bool
-    reason: str  # "available" | "closed" | "no_staff" | "booked" | "unknown_service"
+    reason: str  # "available" | "closed" | "no_staff" | "booked"
     staff_id: Optional[int] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -19,71 +16,46 @@ class AvailabilityResult:
 
 
 @dataclass
-class EarliestAvailabilityResult:
+class EarliestAvailability:
     ok: bool
-    reason: str  # "available" | "closed" | "no_staff" | "unknown_service" | "no_slots"
     staff_id: Optional[int] = None
     staff_name: Optional[str] = None
-    start_dt: Optional[datetime] = None
-    end_dt: Optional[datetime] = None
     start_hhmm: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
 
 
 @dataclass
-class CheckSlotResult:
+class SlotCheckResult:
     ok: bool
-    reason: str  # "available" | "closed" | "no_staff" | "unknown_service" | "booked"
     staff_id: Optional[int] = None
     staff_name: Optional[str] = None
-    alternatives: Optional[List[Dict[str, Any]]] = None  # [{"time": "16:15", "staff_id": 1, "staff_name": "Omar"}]
+    alternatives: Optional[List[Dict[str, Any]]] = None  # [{"time": "17:00", "staff_id": 1, "staff_name": "Karim"}]
+    reason: str = "booked"
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def _dow(dt: datetime) -> int:
-    # Python: Monday=0 ... Sunday=6
-    return dt.weekday()
+    return dt.weekday()  # Mon=0..Sun=6
 
 
-def _to_time(val: Union[dtime, timedelta, str, None]) -> Optional[dtime]:
+def _time_from_mysql(v: Union[time, timedelta]) -> time:
     """
-    MySQL TIME can be returned as:
-    - datetime.time
-    - datetime.timedelta (common with PyMySQL depending on settings)
-    - string like "10:00:00"
-    Normalize to datetime.time.
+    PyMySQL often returns TIME columns as datetime.timedelta.
+    Convert safely to datetime.time.
     """
-    if val is None:
-        return None
-
-    if isinstance(val, dtime):
-        return val
-
-    if isinstance(val, timedelta):
-        total_seconds = int(val.total_seconds())
-        if total_seconds < 0:
-            total_seconds = 0
-        total_seconds = total_seconds % (24 * 3600)
-        hh = total_seconds // 3600
-        mm = (total_seconds % 3600) // 60
-        ss = total_seconds % 60
-        return dtime(hour=hh, minute=mm, second=ss)
-
-    if isinstance(val, str):
-        s = val.strip()
-        # accept HH:MM or HH:MM:SS
-        parts = s.split(":")
-        if len(parts) >= 2:
-            hh = int(parts[0])
-            mm = int(parts[1])
-            ss = int(parts[2]) if len(parts) >= 3 else 0
-            return dtime(hour=hh, minute=mm, second=ss)
-
-    return None
+    if isinstance(v, time):
+        return v
+    if isinstance(v, timedelta):
+        secs = int(v.total_seconds())
+        secs = max(0, secs)
+        hours = (secs // 3600) % 24
+        minutes = (secs % 3600) // 60
+        seconds = secs % 60
+        return time(hours, minutes, seconds)
+    raise TypeError(f"Unsupported TIME value type: {type(v)}")
 
 
-def _get_business_hours(business_id: int, dt: datetime) -> Optional[Tuple[dtime, dtime, bool]]:
+def _get_business_hours(business_id: int, dt: datetime) -> Optional[Tuple[time, time, bool]]:
     with db_cursor() as cur:
         cur.execute(
             "SELECT open_time, close_time, is_closed FROM business_hours WHERE business_id=%s AND dow=%s",
@@ -92,16 +64,9 @@ def _get_business_hours(business_id: int, dt: datetime) -> Optional[Tuple[dtime,
         row = cur.fetchone()
         if not row:
             return None
-
-        open_t = _to_time(row["open_time"])
-        close_t = _to_time(row["close_time"])
-        is_closed = bool(row["is_closed"])
-
-        # If times are missing or not parseable, treat as closed
-        if open_t is None or close_t is None:
-            return None
-
-        return (open_t, close_t, is_closed)
+        open_t = _time_from_mysql(row["open_time"])
+        close_t = _time_from_mysql(row["close_time"])
+        return (open_t, close_t, bool(row["is_closed"]))
 
 
 def _staff_candidates_for_service(business_id: int, service_id: int) -> List[int]:
@@ -110,10 +75,8 @@ def _staff_candidates_for_service(business_id: int, service_id: int) -> List[int
             """
             SELECT s.id
             FROM staff s
-            JOIN staff_services ss
-              ON ss.staff_id=s.id AND ss.business_id=s.business_id
+            JOIN staff_services ss ON ss.staff_id=s.id AND ss.business_id=s.business_id
             WHERE s.business_id=%s AND s.active=1 AND ss.service_id=%s
-            ORDER BY s.id
             """,
             (business_id, service_id),
         )
@@ -124,7 +87,7 @@ def _staff_name(staff_id: int) -> str:
     with db_cursor() as cur:
         cur.execute("SELECT name FROM staff WHERE id=%s LIMIT 1", (staff_id,))
         row = cur.fetchone()
-        return str(row["name"]) if row else f"Staff #{staff_id}"
+        return row["name"] if row and row.get("name") else "Staff"
 
 
 def _has_overlap(staff_id: int, start: datetime, end: datetime) -> bool:
@@ -143,9 +106,6 @@ def _has_overlap(staff_id: int, start: datetime, end: datetime) -> bool:
         return cur.fetchone() is not None
 
 
-# ----------------------------
-# Core: slot finding
-# ----------------------------
 def find_slot_or_suggest(
     business_id: int,
     service_id: int,
@@ -164,15 +124,13 @@ def find_slot_or_suggest(
     if is_closed:
         return AvailabilityResult(ok=False, reason="closed", suggestions=[])
 
-    # clamp to business hours
     day_open = datetime.combine(requested_start.date(), open_t)
     day_close = datetime.combine(requested_start.date(), close_t)
 
     end = requested_start + timedelta(minutes=duration_min)
     if requested_start < day_open or end > day_close:
         suggestions = _suggest_slots(
-            business_id, service_id, duration_min, requested_start,
-            search_days, step_min, max_suggestions
+            business_id, service_id, duration_min, requested_start, search_days, step_min, max_suggestions
         )
         return AvailabilityResult(ok=False, reason="closed", suggestions=suggestions)
 
@@ -182,18 +140,10 @@ def find_slot_or_suggest(
 
     for sid in staff_ids:
         if not _has_overlap(sid, requested_start, end):
-            return AvailabilityResult(
-                ok=True,
-                reason="available",
-                staff_id=sid,
-                start_time=requested_start,
-                end_time=end,
-                suggestions=[]
-            )
+            return AvailabilityResult(ok=True, reason="available", staff_id=sid, start_time=requested_start, end_time=end, suggestions=[])
 
     suggestions = _suggest_slots(
-        business_id, service_id, duration_min, requested_start,
-        search_days, step_min, max_suggestions
+        business_id, service_id, duration_min, requested_start, search_days, step_min, max_suggestions
     )
     return AvailabilityResult(ok=False, reason="booked", suggestions=suggestions)
 
@@ -216,8 +166,7 @@ def _suggest_slots(
 
     for d in range(0, search_days + 1):
         day = anchor.date() + timedelta(days=d)
-
-        hours = _get_business_hours(business_id, datetime.combine(day, dtime(12, 0)))
+        hours = _get_business_hours(business_id, datetime.combine(day, time(12, 0)))
         if not hours:
             continue
         open_t, close_t, is_closed = hours
@@ -231,7 +180,6 @@ def _suggest_slots(
             start = cursor
             end = start + timedelta(minutes=duration_min)
 
-            # skip past times if searching same day
             if d == 0 and end <= anchor:
                 cursor += step
                 continue
@@ -248,57 +196,88 @@ def _suggest_slots(
 
 
 # ----------------------------
-# Public wrappers used by your simulator
+# High-level helper functions
 # ----------------------------
+
+def _parse_date(date_str: str) -> date:
+    # expects YYYY-MM-DD
+    y, m, d = [int(x) for x in date_str.split("-")]
+    return date(y, m, d)
+
+
+def _fmt_hhmm(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
 def find_earliest_availability(
     business_id: int,
     service_name: str,
-    date_str: str,  # YYYY-MM-DD
-    preferred_staff: Optional[str] = None,  # reserved for future: name matching
+    date_str: str,
+    preferred_staff: Optional[str] = None,
     *,
     step_min: int = 15,
-) -> EarliestAvailabilityResult:
+    max_search_days: int = 0,
+) -> EarliestAvailability:
+    """
+    Finds earliest availability ON THE GIVEN DATE (max_search_days=0 means that date only).
+    """
     svc = get_service_by_name_or_code(business_id, service_name)
     if not svc:
-        return EarliestAvailabilityResult(ok=False, reason="unknown_service")
+        return EarliestAvailability(ok=False)
 
     service_id = int(svc["id"])
     duration_min = int(svc["duration_min"])
 
-    day = datetime.fromisoformat(f"{date_str}T00:00:00")
-    hours = _get_business_hours(business_id, day)
+    target_date = _parse_date(date_str)
+    anchor = datetime.combine(target_date, time(0, 0))
+
+    hours = _get_business_hours(business_id, datetime.combine(target_date, time(12, 0)))
     if not hours:
-        return EarliestAvailabilityResult(ok=False, reason="closed")
+        return EarliestAvailability(ok=False)
     open_t, close_t, is_closed = hours
     if is_closed:
-        return EarliestAvailabilityResult(ok=False, reason="closed")
+        return EarliestAvailability(ok=False)
+
+    day_open = datetime.combine(target_date, open_t)
+    day_close = datetime.combine(target_date, close_t)
 
     staff_ids = _staff_candidates_for_service(business_id, service_id)
     if not staff_ids:
-        return EarliestAvailabilityResult(ok=False, reason="no_staff")
+        return EarliestAvailability(ok=False)
 
-    start_cursor = datetime.combine(day.date(), open_t)
-    end_limit = datetime.combine(day.date(), close_t)
+    # If preferred_staff provided, try to filter to matching staff first
+    if preferred_staff:
+        p = preferred_staff.strip().lower()
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id FROM staff WHERE business_id=%s AND active=1 AND LOWER(name) LIKE %s",
+                (business_id, f"%{p}%"),
+            )
+            rows = cur.fetchall()
+            preferred_ids = [int(r["id"]) for r in rows]
+        staff_ids = preferred_ids + [sid for sid in staff_ids if sid not in preferred_ids] if preferred_ids else staff_ids
+
+    cursor = day_open
     step = timedelta(minutes=step_min)
 
-    cursor = start_cursor
-    while cursor + timedelta(minutes=duration_min) <= end_limit:
-        end = cursor + timedelta(minutes=duration_min)
+    while cursor + timedelta(minutes=duration_min) <= day_close:
+        start = cursor
+        end = start + timedelta(minutes=duration_min)
+
         for sid in staff_ids:
-            if not _has_overlap(sid, cursor, end):
-                hhmm = cursor.strftime("%H:%M")
-                return EarliestAvailabilityResult(
+            if not _has_overlap(sid, start, end):
+                return EarliestAvailability(
                     ok=True,
-                    reason="available",
                     staff_id=sid,
                     staff_name=_staff_name(sid),
-                    start_dt=cursor,
-                    end_dt=end,
-                    start_hhmm=hhmm,
+                    start_hhmm=_fmt_hhmm(start),
+                    start_time=start,
+                    end_time=end,
                 )
+
         cursor += step
 
-    return EarliestAvailabilityResult(ok=False, reason="no_slots")
+    return EarliestAvailability(ok=False)
 
 
 def check_slot_and_suggest(
@@ -306,47 +285,41 @@ def check_slot_and_suggest(
     service_name: str,
     date_str: str,
     time_hhmm: str,
-    preferred_staff: Optional[str] = None,  # reserved for future
+    preferred_staff: Optional[str] = None,
     *,
     max_alternatives: int = 3,
-) -> CheckSlotResult:
+    step_min: int = 15,
+) -> SlotCheckResult:
     svc = get_service_by_name_or_code(business_id, service_name)
     if not svc:
-        return CheckSlotResult(ok=False, reason="unknown_service")
+        return SlotCheckResult(ok=False, reason="no_service", alternatives=[])
 
     service_id = int(svc["id"])
     duration_min = int(svc["duration_min"])
 
-    requested_start = datetime.fromisoformat(f"{date_str}T{time_hhmm}:00")
+    target_date = _parse_date(date_str)
+    hh, mm = [int(x) for x in time_hhmm.split(":")]
+    requested_start = datetime.combine(target_date, time(hh, mm))
+
     res = find_slot_or_suggest(
         business_id=business_id,
         service_id=service_id,
         requested_start=requested_start,
         duration_min=duration_min,
-        max_suggestions=max_alternatives,
+        search_days=14,
+        step_min=step_min,
+        max_suggestions=max(5, max_alternatives),
     )
 
     if res.ok:
-        return CheckSlotResult(
-            ok=True,
-            reason="available",
-            staff_id=res.staff_id,
-            staff_name=_staff_name(res.staff_id) if res.staff_id else None,
-            alternatives=[],
-        )
+        sid = int(res.staff_id)
+        return SlotCheckResult(ok=True, staff_id=sid, staff_name=_staff_name(sid), alternatives=[], reason="available")
 
-    # build alternatives from suggestions
-    alternatives: List[Dict[str, Any]] = []
-    if res.suggestions:
-        for (s, _e, sid) in res.suggestions[:max_alternatives]:
-            alternatives.append(
-                {"time": s.strftime("%H:%M"), "staff_id": sid, "staff_name": _staff_name(sid)}
-            )
+    # map suggestions to readable times + staff names (limit max_alternatives)
+    alts: List[Dict[str, Any]] = []
+    for (s, e, sid) in (res.suggestions or []):
+        alts.append({"time": _fmt_hhmm(s), "staff_id": sid, "staff_name": _staff_name(sid)})
+        if len(alts) >= max_alternatives:
+            break
 
-    return CheckSlotResult(
-        ok=False,
-        reason=res.reason if res.reason else "booked",
-        staff_id=None,
-        staff_name=None,
-        alternatives=alternatives,
-    )
+    return SlotCheckResult(ok=False, alternatives=alts, reason=res.reason)
