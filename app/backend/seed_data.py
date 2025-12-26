@@ -1,12 +1,10 @@
-from app.backend.db import ensure_business, db_cursor
-
+from app.backend.db import (
+    ensure_business,
+    db_cursor,
+)
 
 def seed_barber_business() -> int:
-    business_id = ensure_business(
-        slug="barber_demo",
-        name="Downtown Barber Shop",
-        timezone="Asia/Beirut",
-    )
+    business_id = ensure_business(slug="barber_demo", name="Downtown Barber Shop", timezone="Asia/Beirut")
 
     with db_cursor() as cur:
         # staff
@@ -25,10 +23,10 @@ def seed_barber_business() -> int:
         if cur.fetchone()["c"] == 0:
             cur.execute(
                 "INSERT INTO services (business_id, code, name, duration_min, price, currency) VALUES "
-                "(%s,'haircut','Haircut',30,25,'USD'),"
-                "(%s,'fade','Fade',45,35,'USD'),"
-                "(%s,'beard','Beard Trim',20,18,'USD'),"
-                "(%s,'combo','Haircut + Beard',50,45,'USD')",
+                "(%s,'haircut','Haircut',30,80,'AED'),"
+                "(%s,'fade','Fade',45,120,'AED'),"
+                "(%s,'beard','Beard Trim',20,60,'AED'),"
+                "(%s,'combo','Haircut + Beard',50,150,'AED')",
                 (business_id, business_id, business_id, business_id),
             )
 
@@ -37,23 +35,22 @@ def seed_barber_business() -> int:
         if cur.fetchone()["c"] == 0:
             for dow in range(0, 6):  # Mon..Sat
                 cur.execute(
-                    "INSERT INTO business_hours (business_id, dow, open_time, close_time, is_closed) "
-                    "VALUES (%s,%s,'10:00','20:00',0)",
+                    "INSERT INTO business_hours (business_id, dow, open_time, close_time, is_closed) VALUES (%s,%s,'10:00','20:00',0)",
                     (business_id, dow),
                 )
             cur.execute(
-                "INSERT INTO business_hours (business_id, dow, open_time, close_time, is_closed) "
-                "VALUES (%s,6,'00:00','00:00',1)",
+                "INSERT INTO business_hours (business_id, dow, open_time, close_time, is_closed) VALUES (%s,6,'00:00','00:00',1)",
                 (business_id,),
             )
 
-        # mapping
+        # staff_services mapping
         cur.execute("SELECT id, code FROM services WHERE business_id=%s", (business_id,))
-        services = {row["code"]: int(row["id"]) for row in cur.fetchall()}
+        services = {row["code"]: row["id"] for row in cur.fetchall()}
 
         cur.execute("SELECT id, name FROM staff WHERE business_id=%s AND active=1", (business_id,))
-        staff = {row["name"].lower(): int(row["id"]) for row in cur.fetchall()}
+        staff = {row["name"].lower(): row["id"] for row in cur.fetchall()}
 
+        # clear mapping then reinsert for deterministic demo
         cur.execute("DELETE FROM staff_services WHERE business_id=%s", (business_id,))
 
         # everyone haircut

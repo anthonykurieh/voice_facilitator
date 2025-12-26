@@ -7,42 +7,44 @@ from app.pipeline.openai_client import client
 from app.config import DIALOG_MODEL
 
 
-SYSTEM_PROMPT_DIALOG = """\
-You are an NLU + dialogue engine for a PHONE-BASED CUSTOMER SERVICE assistant (BARBER SHOP).
+SYSTEM_PROMPT_DIALOG = """
+You are an NLU + dialogue engine for a PHONE-BASED BARBER SHOP assistant.
 
 Return ONLY valid JSON. No markdown. No extra text.
 
-ALLOWED INTENTS (pick exactly ONE):
+Pick exactly ONE intent from:
 - identify_customer
 - check_availability
 - schedule_appointment
 - reschedule_appointment
 - cancel_appointment
+- modify_appointment
+- list_appointments
 - general_question
 - complaint
 - small_talk
 - end_call
 - fallback
 
-ENTITIES:
+Entities (include only what you are confident about):
 - customer_name
 - phone_number
 - service
 - date
 - time
 - preferred_staff
-- booking_type   (phone/walkin/web)
+- booking_type (phone/walkin/web)
 - notes
+- appointment_id (if user mentions a specific id like "#12")
 
-Output JSON schema:
+Output schema:
 {
   "intent": "...",
-  "confidence": 0.0-1.0,
+  "confidence": 0.0,
   "reply": "...",
   "entities": { ... }
 }
-"""
-
+""".strip()
 
 INTENT_CONFIDENCE_FALLBACK = 0.35
 
@@ -57,14 +59,12 @@ def _build_transcript(session: SessionState, last_user_text: str) -> str:
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    # fast path
+    text = (text or "").strip()
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # locate first {...} block
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -79,7 +79,7 @@ class OpenAIDialogManager:
         session.add_message("user", text)
         transcript_prompt = _build_transcript(session, text)
 
-        # ✅ FIX: do NOT pass response_format (your installed SDK doesn’t support it)
+        # ✅ Do not pass response_format (some installed SDKs don't support it)
         resp = client.responses.create(
             model=DIALOG_MODEL,
             input=[
@@ -104,14 +104,13 @@ class OpenAIDialogManager:
         confidence = float(data.get("confidence", 0.5))
         reply = str(data.get("reply", "Alright."))
         entities = data.get("entities") or {}
+
         if not isinstance(entities, dict):
             entities = {}
 
-        nlu_result = NLUResult(intent=intent, confidence=confidence, entities=entities)
-
         if confidence < INTENT_CONFIDENCE_FALLBACK:
             intent = "fallback"
-            nlu_result.intent = "fallback"
 
+        nlu_result = NLUResult(intent=intent, confidence=confidence, entities=entities)
         session.add_message("assistant", reply)
         return reply, nlu_result
