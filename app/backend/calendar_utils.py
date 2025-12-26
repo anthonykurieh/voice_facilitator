@@ -1,11 +1,15 @@
+# app/backend/calendar_utils.py
+from __future__ import annotations
+
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-import re
+from typing import Optional
 
 
 @dataclass
-class ResolveDateResult:
-    resolved_date: str
+class DateResolveResult:
+    resolved_date: Optional[str]  # ISO: YYYY-MM-DD
     is_ambiguous: bool
     clarification_prompt: str = ""
 
@@ -25,125 +29,122 @@ _MONTHS = {
     "dec": 12, "december": 12,
 }
 
-_DOW = {
-    "monday": 0, "mon": 0,
-    "tuesday": 1, "tue": 1, "tues": 1,
-    "wednesday": 2, "wed": 2,
-    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
-    "friday": 4, "fri": 4,
-    "saturday": 5, "sat": 5,
-    "sunday": 6, "sun": 6,
-}
+
+def _strip_ordinal(s: str) -> str:
+    # 27th -> 27, 1st -> 1, etc.
+    return re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", s, flags=re.IGNORECASE)
 
 
-def resolve_date(text: str, today: date) -> ResolveDateResult:
-    t = (text or "").strip().lower()
-    if not t:
-        return ResolveDateResult(resolved_date=today.isoformat(), is_ambiguous=True, clarification_prompt="Which date did you mean?")
+def resolve_date(text: str, today: Optional[date] = None) -> DateResolveResult:
+    """
+    Resolve human date text to ISO YYYY-MM-DD.
+    Never throws; returns is_ambiguous=True with a prompt on invalid/unclear.
+    """
+    today = today or date.today()
+    raw = (text or "").strip().lower()
+    if not raw:
+        return DateResolveResult(None, True, "Sorry — what date did you mean? For example: December 27.")
 
-    if "today" in t:
-        return ResolveDateResult(resolved_date=today.isoformat(), is_ambiguous=False)
+    s = _strip_ordinal(raw)
 
-    if "tomorrow" in t:
-        d = today + timedelta(days=1)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+    # Relative dates
+    if "day after tomorrow" in s:
+        return DateResolveResult((today + timedelta(days=2)).isoformat(), False, "")
+    if "tomorrow" in s:
+        return DateResolveResult((today + timedelta(days=1)).isoformat(), False, "")
+    if "today" in s:
+        return DateResolveResult(today.isoformat(), False, "")
 
-    if "day after tomorrow" in t:
-        d = today + timedelta(days=2)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+    # Remove weekday words (avoid confusion)
+    s = re.sub(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", "", s).strip()
 
-    # "next monday"
-    m = re.search(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b", t)
-    if m:
-        target = _DOW[m.group(1)]
-        delta = (target - today.weekday()) % 7
-        delta = 7 if delta == 0 else delta
-        d = today + timedelta(days=delta)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+    # Extract year if present
+    year = today.year
+    y = re.search(r"\b(20\d{2})\b", s)
+    if y:
+        year = int(y.group(1))
 
-    # plain weekday "monday" (ambiguous: could be upcoming)
-    m = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b", t)
-    if m:
-        target = _DOW[m.group(1)]
-        delta = (target - today.weekday()) % 7
-        d = today + timedelta(days=delta)
-        if delta == 0:
-            # same weekday: ambiguous (this week vs next week)
-            prompt = f"Just to confirm — do you mean today ({today.isoformat()}) or next {m.group(1).title()}?"
-            return ResolveDateResult(resolved_date=today.isoformat(), is_ambiguous=True, clarification_prompt=prompt)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
-
-    # formats:
-    #  - "24/12/2025" or "24-12-2025"
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", t)
+    # Pattern A: "27 december" or "27 of december"
+    m = re.search(r"\b(\d{1,2})\s*(of\s+)?([a-z]+)\b", s)
     if m:
         dd = int(m.group(1))
-        mm = int(m.group(2))
-        yy = m.group(3)
-        year = int(yy) if yy else today.year
-        if year < 100:
-            year += 2000
-        d = date(year, mm, dd)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+        mon_word = m.group(3)
+        mm = _MONTHS.get(mon_word, _MONTHS.get(mon_word[:3]))
+        if not mm:
+            return DateResolveResult(None, True, "Sorry — which month is that? For example: December 27.")
 
-    # "december 22" / "22 december" / optional year
-    m = re.search(r"\b(\d{1,2})\s+(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)(?:\s+(\d{4}))?\b", t)
-    if m:
-        dd = int(m.group(1))
-        mm = _MONTHS[m.group(2)]
-        year = int(m.group(3)) if m.group(3) else today.year
-        d = date(year, mm, dd)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+        try:
+            d = date(year, mm, dd)
+            return DateResolveResult(d.isoformat(), False, "")
+        except ValueError:
+            return DateResolveResult(None, True, "That date doesn’t look valid — can you repeat it? For example: December 27, 2025.")
 
-    m = re.search(r"\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+(\d{1,2})(?:\s+(\d{4}))?\b", t)
+    # Pattern B: "december 27"
+    m = re.search(r"\b([a-z]+)\s+(\d{1,2})\b", s)
     if m:
-        mm = _MONTHS[m.group(1)]
+        mon_word = m.group(1)
         dd = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else today.year
-        d = date(year, mm, dd)
-        return ResolveDateResult(resolved_date=d.isoformat(), is_ambiguous=False)
+        mm = _MONTHS.get(mon_word, _MONTHS.get(mon_word[:3]))
+        if not mm:
+            return DateResolveResult(None, True, "Sorry — which month is that? For example: December 27.")
 
-    # If nothing matches: ambiguous
-    return ResolveDateResult(
-        resolved_date=today.isoformat(),
-        is_ambiguous=True,
-        clarification_prompt="Sorry — what date did you mean? For example: December 22.",
-    )
+        try:
+            d = date(year, mm, dd)
+            return DateResolveResult(d.isoformat(), False, "")
+        except ValueError:
+            return DateResolveResult(None, True, "That date doesn’t look valid — can you repeat it? For example: December 27, 2025.")
+
+    # Pattern C: ISO already (YYYY-MM-DD)
+    try:
+        dt = datetime.strptime(s.strip(), "%Y-%m-%d").date()
+        return DateResolveResult(dt.isoformat(), False, "")
+    except Exception:
+        pass
+
+    return DateResolveResult(None, True, "Sorry — what date did you mean? For example: December 27.")
 
 
-def parse_time_to_hhmm(text: str) -> str:
-    t = (text or "").strip().lower()
-    if not t:
-        return ""
+def parse_time_to_hhmm(text: str) -> Optional[str]:
+    """
+    Accepts: "4 pm", "4pm", "16:30", "1600", "sixteen hundred" (best-effort numeric)
+    Returns "HH:MM" or None.
+    """
+    if not text:
+        return None
+    s = text.strip().lower()
 
-    # "16:30"
-    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
+    # 16:30
+    m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", s)
     if m:
         hh = int(m.group(1))
         mm = int(m.group(2))
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
+        return f"{hh:02d}:{mm:02d}"
 
-    # "4 pm", "4pm", "10 am"
-    m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+    # 1600
+    m = re.search(r"\b([01]\d|2[0-3])([0-5]\d)\b", re.sub(r"\s+", "", s))
     if m:
         hh = int(m.group(1))
-        ampm = m.group(2)
+        mm = int(m.group(2))
+        return f"{hh:02d}:{mm:02d}"
+
+    # 4pm / 4 pm / 4 p.m.
+    m = re.search(r"\b(\d{1,2})(?:\s*:\s*([0-5]\d))?\s*(am|pm)\b", s.replace(".", ""))
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2) or "00")
+        ampm = m.group(3)
         if hh == 12:
             hh = 0
         if ampm == "pm":
             hh += 12
-        return f"{hh:02d}:00"
-
-    # plain "16 hundred" / "1600"
-    m = re.search(r"\b(\d{3,4})\b", t)
-    if m:
-        val = m.group(1)
-        if len(val) == 3:
-            val = "0" + val
-        hh = int(val[:2])
-        mm = int(val[2:])
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return f"{hh:02d}:{mm:02d}"
 
-    return ""
+    # Bare hour: "10" => 10:00
+    m = re.search(r"\b(\d{1,2})\b", s)
+    if m:
+        hh = int(m.group(1))
+        if 0 <= hh <= 23:
+            return f"{hh:02d}:00"
+
+    return None

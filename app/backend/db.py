@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pymysql
 from dotenv import load_dotenv
 
-# Load .env from project root automatically (works if you run from repo root)
 load_dotenv()
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
@@ -163,6 +162,24 @@ def init_db():
         ON DELETE RESTRICT
     ) ENGINE=InnoDB;
 
+    -- NEW: calls table so we can infer business/customer from call_id
+    CREATE TABLE IF NOT EXISTS calls (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      call_id VARCHAR(64) NOT NULL UNIQUE,
+      business_id BIGINT NOT NULL,
+      customer_id BIGINT NULL,
+      session_id VARCHAR(64) NOT NULL,
+      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ended_at TIMESTAMP NULL DEFAULT NULL,
+      INDEX idx_calls_session (session_id),
+      CONSTRAINT fk_calls_business
+        FOREIGN KEY (business_id) REFERENCES businesses(id)
+        ON DELETE CASCADE,
+      CONSTRAINT fk_calls_customer
+        FOREIGN KEY (customer_id) REFERENCES customers(id)
+        ON DELETE SET NULL
+    ) ENGINE=InnoDB;
+
     CREATE TABLE IF NOT EXISTS conversation_events (
       id BIGINT PRIMARY KEY AUTO_INCREMENT,
       business_id BIGINT NOT NULL,
@@ -207,9 +224,6 @@ def ensure_business(slug: str, name: str, timezone: str = "Asia/Dubai") -> int:
 
 
 def get_or_create_business(name: str, slug: Optional[str] = None, timezone: str = "Asia/Dubai") -> int:
-    """
-    Used by simulate_voice_call. If slug isn't provided, derive one from the name.
-    """
     slug_val = slug or name.strip().lower().replace(" ", "_")[:64]
     return ensure_business(slug=slug_val, name=name, timezone=timezone)
 
@@ -238,6 +252,60 @@ def upsert_customer(business_id: int, name: str, phone: str) -> int:
 
 
 # =========================
+# Call lifecycle
+# =========================
+
+def log_call_start(session_id: str, business_id: int) -> str:
+    """
+    Creates a calls row and returns a call_id string.
+    We use session_id as call_id for simplicity.
+    """
+    call_id = str(session_id)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO calls (call_id, business_id, customer_id, session_id)
+            VALUES (%s,%s,NULL,%s)
+            ON DUPLICATE KEY UPDATE business_id=VALUES(business_id)
+            """,
+            (call_id, business_id, session_id),
+        )
+    return call_id
+
+
+def attach_customer_to_call(call_id: str, customer_id: int) -> None:
+    with db_cursor() as cur:
+        cur.execute(
+            "UPDATE calls SET customer_id=%s WHERE call_id=%s",
+            (customer_id, str(call_id)),
+        )
+
+
+def log_call_end(call_id: str) -> None:
+    with db_cursor() as cur:
+        cur.execute(
+            "UPDATE calls SET ended_at=NOW() WHERE call_id=%s",
+            (str(call_id),),
+        )
+
+
+def _get_call_context(call_id: str) -> Tuple[Optional[int], Optional[int], str]:
+    """
+    Returns (business_id, customer_id, session_id) for a call_id.
+    session_id will default to call_id if row not found.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT business_id, customer_id, session_id FROM calls WHERE call_id=%s LIMIT 1",
+            (str(call_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None, None, str(call_id)
+        return row.get("business_id"), row.get("customer_id"), row.get("session_id") or str(call_id)
+
+
+# =========================
 # Conversation logging
 # =========================
 
@@ -255,19 +323,20 @@ def log_message(
 ) -> None:
     """
     Writes to conversation_events.
-    NOTE: entities MUST be JSON-encoded string for PyMySQL.
+    IMPORTANT: entities must be JSON string (PyMySQL cannot accept dict directly).
     """
-    entities_json = None
+    ent_json = None
     if entities is not None:
-        entities_json = json.dumps(entities, ensure_ascii=False)
+        ent_json = json.dumps(entities, ensure_ascii=False)
 
-    # If simulate_voice_call uses call_id but your schema logs by session_id,
-    # we store call_id inside session_id if session_id not provided.
-    sess = session_id or str(call_id)
+    # infer from calls table if not passed
+    b2, c2, s2 = _get_call_context(str(call_id))
+    business_id = business_id or b2
+    customer_id = customer_id if customer_id is not None else c2
+    session_id = session_id or s2
 
-    if business_id is None:
-        # we can't infer business_id safely: caller should pass it
-        business_id = 1  # minimal default; better: always pass business_id
+    if not business_id:
+        raise RuntimeError("log_message: business_id is missing (call not initialized?).")
 
     with db_cursor() as cur:
         cur.execute(
@@ -277,12 +346,12 @@ def log_message(
             VALUES
               (%s,%s,%s,%s,%s,%s,%s,%s)
             """,
-            (business_id, customer_id, sess, role, text, intent, confidence, entities_json),
+            (business_id, customer_id, session_id, role, text, intent, confidence, ent_json),
         )
 
 
 # =========================
-# Services
+# Services / Staff helpers
 # =========================
 
 def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional[Dict[str, Any]]:
@@ -304,75 +373,61 @@ def get_service_by_name_or_code(business_id: int, service_text: str) -> Optional
         return cur.fetchone()
 
 
-def list_services(business_id: int) -> List[Dict[str, Any]]:
+def get_staff_name(business_id: int, staff_id: int) -> Optional[str]:
     with db_cursor() as cur:
         cur.execute(
-            "SELECT id, code, name, duration_min, price, currency FROM services WHERE business_id=%s AND active=1",
-            (business_id,),
+            "SELECT name FROM staff WHERE business_id=%s AND id=%s LIMIT 1",
+            (business_id, staff_id),
         )
-        return cur.fetchall()
+        row = cur.fetchone()
+        return str(row["name"]) if row else None
 
 
 # =========================
-# Appointments CRUD
+# Appointments: reads
 # =========================
 
-def create_appointment(
-    business_id: int,
-    customer_id: int,
-    staff_id: int,
-    service_id: int,
-    booking_type: str,
-    start_time: datetime,
-    end_time: datetime,
-    quoted_price: float,
-    currency: str,
-    notes: Optional[str] = None,
-) -> int:
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO appointments
-              (business_id, customer_id, staff_id, service_id, booking_type, start_time, end_time, quoted_price, currency, notes)
-            VALUES
-              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                business_id,
-                customer_id,
-                staff_id,
-                service_id,
-                booking_type,
-                start_time,
-                end_time,
-                quoted_price,
-                currency,
-                notes,
-            ),
-        )
-        return int(cur.lastrowid)
-
-
-def get_appointment_detail(appointment_id: int) -> Optional[Dict[str, Any]]:
+def get_appointment_detail(business_id: int, customer_id: int, appointment_id: int) -> Optional[Dict[str, Any]]:
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT
-              a.*,
+              a.id,
+              a.business_id,
+              a.customer_id,
+              a.staff_id,
+              a.service_id,
+              a.status,
+              a.start_time,
+              a.end_time,
+              a.quoted_price,
+              a.currency,
+              a.notes,
               s.name AS service_name,
               s.code AS service_code,
+              s.duration_min AS duration_min,
               st.name AS staff_name
             FROM appointments a
             JOIN services s ON s.id=a.service_id
             JOIN staff st ON st.id=a.staff_id
-            WHERE a.id=%s
+            WHERE a.business_id=%s
+              AND a.customer_id=%s
+              AND a.id=%s
+            LIMIT 1
             """,
-            (appointment_id,),
+            (business_id, customer_id, appointment_id),
         )
         return cur.fetchone()
 
 
-def list_upcoming_appointments(business_id: int, customer_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+def list_upcoming_appointments(
+    business_id: int,
+    customer_id: int,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    now = now or datetime.now()
     with db_cursor() as cur:
         cur.execute(
             """
@@ -388,12 +443,12 @@ def list_upcoming_appointments(business_id: int, customer_id: int, limit: int = 
             JOIN staff st ON st.id=a.staff_id
             WHERE a.business_id=%s
               AND a.customer_id=%s
-              AND a.start_time >= NOW()
+              AND a.start_time >= %s
               AND a.status IN ('confirmed','completed')
             ORDER BY a.start_time ASC
             LIMIT %s
             """,
-            (business_id, customer_id, limit),
+            (business_id, customer_id, now, limit),
         )
         return cur.fetchall()
 
@@ -434,205 +489,47 @@ def find_appointment_candidates(
         return cur.fetchall()
 
 
-def cancel_appointment(appointment_id: int, note: Optional[str] = None) -> None:
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE appointments
-            SET status='cancelled',
-                notes=COALESCE(%s, notes)
-            WHERE id=%s
-            """,
-            (note, appointment_id),
-        )
+# =========================
+# Appointments: CRUD writes
+# =========================
 
-
-def reschedule_appointment(
-    appointment_id: int,
-    new_staff_id: int,
-    new_start_time: datetime,
-    new_end_time: datetime,
-    note: Optional[str] = None,
-) -> None:
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE appointments
-            SET staff_id=%s,
-                start_time=%s,
-                end_time=%s,
-                notes=CASE
-                    WHEN %s IS NULL THEN notes
-                    WHEN notes IS NULL OR notes='' THEN %s
-                    ELSE CONCAT(notes, '\n', %s)
-                END
-            WHERE id=%s
-            """,
-            (new_staff_id, new_start_time, new_end_time, note, note, note, appointment_id),
-        )
-
-
-def update_appointment_service(
-    appointment_id: int,
-    new_service_id: int,
-    new_end_time: Optional[datetime] = None,
-    note: Optional[str] = None,
-) -> None:
-    """
-    Update service_id for an appointment.
-    If you already computed a new end_time (service duration changed), pass it.
-    """
-    with db_cursor() as cur:
-        if new_end_time is None:
-            cur.execute(
-                """
-                UPDATE appointments
-                SET service_id=%s,
-                    notes=CASE
-                        WHEN %s IS NULL THEN notes
-                        WHEN notes IS NULL OR notes='' THEN %s
-                        ELSE CONCAT(notes, '\n', %s)
-                    END
-                WHERE id=%s
-                """,
-                (new_service_id, note, note, note, appointment_id),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE appointments
-                SET service_id=%s,
-                    end_time=%s,
-                    notes=CASE
-                        WHEN %s IS NULL THEN notes
-                        WHEN notes IS NULL OR notes='' THEN %s
-                        ELSE CONCAT(notes, '\n', %s)
-                    END
-                WHERE id=%s
-                """,
-                (new_service_id, new_end_time, note, note, note, appointment_id),
-            )
-
-from typing import Optional, List, Dict, Any
-from datetime import datetime
-
-
-# -------------------------
-# Call “lifecycle” helpers
-# -------------------------
-
-def log_call_start(session_id: str, business_id: int) -> str:
-    """
-    You don't have a calls table right now.
-    We'll treat call_id == session_id to keep simulate_voice_call working.
-    """
-    return str(session_id)
-
-
-def log_call_end(call_id: str) -> None:
-    """
-    No-op until you add a calls table.
-    """
-    return
-
-
-def attach_customer_to_call(call_id: str, customer_id: int) -> None:
-    """
-    No calls table. No-op for now.
-    We still keep the function so imports don't break.
-    """
-    return
-
-
-# -------------------------
-# Appointment reads
-# -------------------------
-
-def get_appointment_detail(business_id: int, customer_id: int, appointment_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Returns appointment + service/staff fields used by simulate_voice_call.py:
-    - service_name
-    - duration_min
-    - staff_name
-    - start_time/end_time/status
-    """
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-              a.id,
-              a.business_id,
-              a.customer_id,
-              a.staff_id,
-              a.service_id,
-              a.status,
-              a.start_time,
-              a.end_time,
-              a.notes,
-              s.name AS service_name,
-              s.code AS service_code,
-              s.duration_min AS duration_min,
-              s.price AS service_price,
-              s.currency AS service_currency,
-              st.name AS staff_name
-            FROM appointments a
-            JOIN services s ON s.id=a.service_id
-            JOIN staff st ON st.id=a.staff_id
-            WHERE a.business_id=%s
-              AND a.customer_id=%s
-              AND a.id=%s
-            LIMIT 1
-            """,
-            (business_id, customer_id, appointment_id),
-        )
-        return cur.fetchone()
-
-
-def list_upcoming_appointments(
+def create_appointment(
     business_id: int,
     customer_id: int,
-    *,
-    now: Optional[datetime] = None,
-    limit: int = 10
-) -> List[Dict[str, Any]]:
-    """
-    simulate_voice_call passes now=datetime.now().
-    """
-    now = now or datetime.now()
+    staff_id: int,
+    service_id: int,
+    booking_type: str,
+    start_time: datetime,
+    end_time: datetime,
+    quoted_price: float,
+    currency: str,
+    notes: Optional[str] = None,
+) -> int:
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT
-              a.id,
-              a.start_time,
-              a.end_time,
-              a.status,
-              s.name AS service_name,
-              st.name AS staff_name
-            FROM appointments a
-            JOIN services s ON s.id=a.service_id
-            JOIN staff st ON st.id=a.staff_id
-            WHERE a.business_id=%s
-              AND a.customer_id=%s
-              AND a.start_time >= %s
-              AND a.status IN ('confirmed','completed')
-            ORDER BY a.start_time ASC
-            LIMIT %s
+            INSERT INTO appointments
+              (business_id, customer_id, staff_id, service_id, booking_type, start_time, end_time, quoted_price, currency, notes)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
-            (business_id, customer_id, now, limit),
+            (
+                business_id,
+                customer_id,
+                staff_id,
+                service_id,
+                booking_type,
+                start_time,
+                end_time,
+                quoted_price,
+                currency,
+                notes,
+            ),
         )
-        return cur.fetchall()
+        return int(cur.lastrowid)
 
-
-# -------------------------
-# Appointment mutations
-# -------------------------
 
 def cancel_appointment(business_id: int, customer_id: int, appointment_id: int, *, reason: Optional[str] = None) -> bool:
-    """
-    Only cancels if it's the customer's appointment and currently confirmed.
-    Returns True if updated, False otherwise.
-    """
     note = f"cancel_reason={reason}" if reason else None
     with db_cursor() as cur:
         cur.execute(
@@ -664,10 +561,6 @@ def update_appointment_time_and_staff(
     new_end: datetime,
     note: Optional[str] = None,
 ) -> bool:
-    """
-    Reschedules (and/or changes barber) for a confirmed appointment.
-    Returns True if updated.
-    """
     with db_cursor() as cur:
         cur.execute(
             """
@@ -701,10 +594,6 @@ def update_appointment_service(
     currency: str,
     note: Optional[str] = None,
 ) -> bool:
-    """
-    Changes service, and updates end_time + quoted_price/currency.
-    Returns True if updated.
-    """
     with db_cursor() as cur:
         cur.execute(
             """
@@ -730,41 +619,3 @@ def update_appointment_service(
             ),
         )
         return cur.rowcount > 0
-
-def update_appointment_time_and_staff(
-    appointment_id: int,
-    new_staff_id: int,
-    new_start_time: datetime,
-    new_end_time: datetime,
-    note: Optional[str] = None,
-) -> None:
-    """
-    Backwards-compatible name used by simulate_voice_call.py.
-    """
-    reschedule_appointment(
-        appointment_id=appointment_id,
-        new_staff_id=new_staff_id,
-        new_start_time=new_start_time,
-        new_end_time=new_end_time,
-        note=note,
-    )
-
-from typing import Optional
-
-def get_staff_name(business_id: int, staff_id: int) -> Optional[str]:
-    """
-    Returns staff.name for the given business + staff id.
-    Used by availability.py.
-    """
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT name
-            FROM staff
-            WHERE business_id=%s AND id=%s
-            LIMIT 1
-            """,
-            (business_id, staff_id),
-        )
-        row = cur.fetchone()
-        return str(row["name"]) if row else None

@@ -1,116 +1,86 @@
+# app/pipeline/dialog_openai.py
+from __future__ import annotations
+
 import json
-from typing import Tuple, Dict, Any, List
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+from openai import OpenAI
 
 from app.pipeline.types import SessionState
-from app.pipeline.nlu_openai import NLUResult
-from app.pipeline.openai_client import client
-from app.config import DIALOG_MODEL
 
 
-SYSTEM_PROMPT_DIALOG = """
-You are an NLU + dialogue engine for a PHONE-BASED BARBER SHOP assistant.
-
-Return ONLY valid JSON. No markdown. No extra text.
-
-Pick exactly ONE intent from:
-- identify_customer
-- check_availability
-- schedule_appointment
-- reschedule_appointment
-- cancel_appointment
-- modify_appointment
-- list_appointments
-- general_question
-- complaint
-- small_talk
-- end_call
-- fallback
-
-Entities (include only what you are confident about):
-- customer_name
-- phone_number
-- service
-- date
-- time
-- preferred_staff
-- booking_type (phone/walkin/web)
-- notes
-- appointment_id (if user mentions a specific id like "#12")
-
-Output schema:
-{
-  "intent": "...",
-  "confidence": 0.0,
-  "reply": "...",
-  "entities": { ... }
-}
-""".strip()
-
-INTENT_CONFIDENCE_FALLBACK = 0.35
-
-
-def _build_transcript(session: SessionState, last_user_text: str) -> str:
-    lines: List[str] = []
-    for msg in session.messages:
-        speaker = "User" if msg.role == "user" else "Agent"
-        lines.append(f"{speaker}: {msg.content}")
-    lines.append(f"\n[Last user message]: {last_user_text}")
-    return "Conversation so far:\n" + "\n".join(lines)
-
-
-def _extract_first_json_object(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        chunk = text[start : end + 1]
-        return json.loads(chunk)
-
-    raise json.JSONDecodeError("No JSON object found", text, 0)
+@dataclass
+class NLUResult:
+    intent: str
+    entities: Dict[str, Any]
+    confidence: float = 0.0
 
 
 class OpenAIDialogManager:
-    def handle_user_utterance(self, session: SessionState, text: str) -> Tuple[str, NLUResult]:
-        session.add_message("user", text)
-        transcript_prompt = _build_transcript(session, text)
+    """
+    Uses Responses API but WITHOUT passing response_format (to avoid SDK mismatch).
+    We force JSON by instruction and then json.loads() it.
+    """
+    def __init__(self, model: str = "gpt-4.1-mini"):
+        self.client = OpenAI()
+        self.model = model
 
-        # ✅ Do not pass response_format (some installed SDKs don't support it)
-        resp = client.responses.create(
-            model=DIALOG_MODEL,
+    def handle_user_utterance(self, session: SessionState, user_text: str) -> Tuple[str, NLUResult]:
+        system = (
+            "You are a voice-call booking assistant for a barber shop.\n"
+            "Return STRICT JSON ONLY with keys: reply, intent, confidence, entities.\n"
+            "intents: schedule_appointment, check_availability, list_appointments, cancel_appointment, "
+            "reschedule_appointment, modify_appointment, smalltalk, other.\n"
+            "entities may include: customer_name, phone_number, service, date, time, preferred_staff, appointment_id.\n"
+            "If user says 'tomorrow', keep entity date='tomorrow' (do not convert to a year).\n"
+        )
+
+        user = f"User said: {user_text}"
+
+        resp = self.client.responses.create(
+            model=self.model,
             input=[
-                {"role": "system", "content": SYSTEM_PROMPT_DIALOG},
-                {"role": "user", "content": transcript_prompt},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
         )
 
-        raw = (resp.output_text or "").strip()
-
+        # Try to extract text output
+        text = None
         try:
-            data: Dict[str, Any] = _extract_first_json_object(raw)
+            # Most SDK builds expose output_text
+            text = resp.output_text
         except Exception:
-            data = {
-                "intent": "fallback",
-                "confidence": 0.2,
-                "reply": "Sorry — I didn’t catch that. Could you repeat it?",
-                "entities": {},
-            }
+            pass
 
-        intent = str(data.get("intent", "fallback"))
-        confidence = float(data.get("confidence", 0.5))
-        reply = str(data.get("reply", "Alright."))
+        if not text:
+            # fallback: attempt manual extraction
+            try:
+                parts = []
+                for item in resp.output:
+                    for c in item.content:
+                        if getattr(c, "type", None) in ("output_text", "text"):
+                            parts.append(getattr(c, "text", ""))
+                text = "\n".join(parts).strip()
+            except Exception:
+                text = ""
+
+        # Parse JSON safely
+        try:
+            data = json.loads(text)
+        except Exception:
+            # If the model didn't obey, degrade gracefully
+            return (
+                "Sorry — I didn’t catch that. Could you rephrase?",
+                NLUResult(intent="other", entities={}, confidence=0.0),
+            )
+
+        reply = str(data.get("reply", "")).strip() or "Okay."
+        intent = str(data.get("intent", "other")).strip() or "other"
+        conf = float(data.get("confidence", 0.0) or 0.0)
         entities = data.get("entities") or {}
-
         if not isinstance(entities, dict):
             entities = {}
 
-        if confidence < INTENT_CONFIDENCE_FALLBACK:
-            intent = "fallback"
-
-        nlu_result = NLUResult(intent=intent, confidence=confidence, entities=entities)
-        session.add_message("assistant", reply)
-        return reply, nlu_result
+        return reply, NLUResult(intent=intent, entities=entities, confidence=conf)

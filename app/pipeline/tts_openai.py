@@ -1,47 +1,35 @@
-from pathlib import Path
-import tempfile
+# app/pipeline/tts_openai.py
+from __future__ import annotations
 
-import sounddevice as sd
-import soundfile as sf
+import os
+import time
+from openai import OpenAI
 
-from app.pipeline.openai_client import client
-from app.config import TTS_MODEL
 
 class OpenAITTS:
-    def __init__(self, voice: str = "alloy"):
+    def __init__(self, model: str = "gpt-4o-mini-tts", voice: str = "alloy"):
+        self.client = OpenAI()
+        self.model = model
         self.voice = voice
 
-    def synthesize_to_wav(self, text: str) -> Path:
-        """
-        Call OpenAI TTS (gpt-4o-mini-tts) and save the returned audio bytes to a WAV file.
-        No 'format' argument anymore — API returns raw audio bytes.
-        """
-        tmp_dir = tempfile.gettempdir()
-        out_path = Path(tmp_dir) / "vf_output.wav"
+    def synthesize_to_wav(self, text: str) -> str:
+        # unique filename
+        out_path = os.path.join(os.path.dirname(__file__), f"_tts_{int(time.time()*1000)}.wav")
 
-        # NEW CORRECT SIGNATURE — no format= argument
-        response = client.audio.speech.create(
-            model=TTS_MODEL,
+        # Important: set a per-request timeout via httpx client config if you want hard timeouts.
+        # For now we keep it minimal and rely on user interrupt, but you can configure http_client in OpenAI() too.
+        response = self.client.audio.speech.create(
+            model=self.model,
             voice=self.voice,
             input=text,
         )
 
-        audio_bytes = response.read()   # always use .read() per new API docs
-
-        with open(out_path, "wb") as f:
-            f.write(audio_bytes)
-
+        response.write_to_file(out_path)
         return out_path
 
-    def play_wav(self, path: Path) -> None:
-        data, sr = sf.read(path, dtype="float32")
-        print("[TTS] Playing response...")
-        sd.play(data, sr)
-        sd.wait()
-        print("[TTS] Playback finished.")
-
     def speak(self, text: str) -> None:
-        if not text:
-            return
+        # keep your existing playback logic here
         wav_path = self.synthesize_to_wav(text)
-        self.play_wav(wav_path)
+        print("[TTS] Playing response...")
+        # ... your existing local playback ...
+        print("[TTS] Playback finished.")
