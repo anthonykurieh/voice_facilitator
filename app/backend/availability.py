@@ -1,3 +1,5 @@
+# app/backend/availability.py
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,9 +16,7 @@ def _to_time(x) -> time:
         return x
     if isinstance(x, timedelta):
         return (datetime.min + x).time()
-    # fallback: try parsing
     if isinstance(x, str):
-        # "10:00:00"
         hh, mm, ss = x.split(":")
         return time(int(hh), int(mm), int(ss))
     raise TypeError(f"Unsupported time type: {type(x)}")
@@ -59,17 +59,64 @@ def _get_business_hours(business_id: int, dt: datetime) -> Optional[Tuple[time, 
         return (_to_time(row["open_time"]), _to_time(row["close_time"]), bool(row["is_closed"]))
 
 
-def _staff_candidates_for_service(business_id: int, service_id: int) -> List[int]:
+def _preferred_staff_ids(business_id: int, preferred_staff: Optional[str]) -> Optional[List[int]]:
+    """
+    If preferred_staff is provided, return matching staff IDs (active only).
+    If no matches, return [] (meaning: preference cannot be satisfied).
+    If preferred_staff is None/empty, return None (meaning: no preference filter).
+    """
+    if not preferred_staff or not str(preferred_staff).strip():
+        return None
+
+    q = str(preferred_staff).strip().lower()
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT s.id
-            FROM staff s
-            JOIN staff_services ss ON ss.staff_id=s.id AND ss.business_id=s.business_id
-            WHERE s.business_id=%s AND s.active=1 AND ss.service_id=%s
+            SELECT id
+            FROM staff
+            WHERE business_id=%s AND active=1
+              AND (LOWER(name)=%s OR LOWER(name) LIKE %s)
             """,
-            (business_id, service_id),
+            (business_id, q, f"%{q}%"),
         )
+        return [int(r["id"]) for r in cur.fetchall()]
+
+
+def _staff_candidates_for_service(
+    business_id: int,
+    service_id: int,
+    *,
+    preferred_staff: Optional[str] = None
+) -> List[int]:
+    preferred_ids = _preferred_staff_ids(business_id, preferred_staff)
+    # preferred_ids == [] means user asked for someone that doesn't exist/match
+    if preferred_ids == []:
+        return []
+
+    with db_cursor() as cur:
+        if preferred_ids is None:
+            cur.execute(
+                """
+                SELECT s.id
+                FROM staff s
+                JOIN staff_services ss ON ss.staff_id=s.id AND ss.business_id=s.business_id
+                WHERE s.business_id=%s AND s.active=1 AND ss.service_id=%s
+                """,
+                (business_id, service_id),
+            )
+        else:
+            placeholders = ",".join(["%s"] * len(preferred_ids))
+            cur.execute(
+                f"""
+                SELECT s.id
+                FROM staff s
+                JOIN staff_services ss ON ss.staff_id=s.id AND ss.business_id=s.business_id
+                WHERE s.business_id=%s AND s.active=1 AND ss.service_id=%s
+                  AND s.id IN ({placeholders})
+                """,
+                (business_id, service_id, *preferred_ids),
+            )
+
         return [int(r["id"]) for r in cur.fetchall()]
 
 
@@ -95,11 +142,12 @@ def _suggest_slots(
     duration_min: int,
     anchor: datetime,
     *,
+    preferred_staff: Optional[str],
     search_days: int,
     step_min: int,
     max_suggestions: int,
 ) -> List[Tuple[datetime, datetime, int]]:
-    staff_ids = _staff_candidates_for_service(business_id, service_id)
+    staff_ids = _staff_candidates_for_service(business_id, service_id, preferred_staff=preferred_staff)
     if not staff_ids:
         return []
 
@@ -143,6 +191,7 @@ def find_slot_or_suggest(
     requested_start: datetime,
     duration_min: int,
     *,
+    preferred_staff: Optional[str] = None,
     search_days: int = 14,
     step_min: int = 15,
     max_suggestions: int = 5
@@ -166,11 +215,12 @@ def find_slot_or_suggest(
     if requested_start < day_open or end > day_close:
         suggestions = _suggest_slots(
             business_id, service_id, duration_min, requested_start,
+            preferred_staff=preferred_staff,
             search_days=search_days, step_min=step_min, max_suggestions=max_suggestions
         )
         return False, "closed", None, None, None, suggestions
 
-    staff_ids = _staff_candidates_for_service(business_id, service_id)
+    staff_ids = _staff_candidates_for_service(business_id, service_id, preferred_staff=preferred_staff)
     if not staff_ids:
         return False, "no_staff", None, None, None, []
 
@@ -180,6 +230,7 @@ def find_slot_or_suggest(
 
     suggestions = _suggest_slots(
         business_id, service_id, duration_min, requested_start,
+        preferred_staff=preferred_staff,
         search_days=search_days, step_min=step_min, max_suggestions=max_suggestions
     )
     return False, "booked", None, None, None, suggestions
@@ -203,16 +254,18 @@ def check_slot_and_suggest(
 
     start_dt = datetime.strptime(f"{date_str} {time_hhmm}", "%Y-%m-%d %H:%M")
     duration_min = int(svc["duration_min"])
+
     ok, reason, staff_id, sdt, edt, suggestions = find_slot_or_suggest(
         business_id=business_id,
         service_id=int(svc["id"]),
         requested_start=start_dt,
         duration_min=duration_min,
+        preferred_staff=preferred_staff,
         max_suggestions=max(5, max_alternatives),
     )
 
     if ok:
-        staff_name = get_staff_name(int(staff_id)) if staff_id else None
+        staff_name = get_staff_name(business_id, int(staff_id)) if staff_id else None
         return SlotCheckResult(
             ok=True,
             reason="available",
@@ -223,14 +276,13 @@ def check_slot_and_suggest(
             alternatives=[],
         )
 
-    # map suggestions -> alternatives
     alts: List[Dict[str, Any]] = []
     for (s, e, sid) in (suggestions or [])[:max_alternatives]:
         alts.append(
             {
                 "time": s.strftime("%H:%M"),
                 "staff_id": int(sid),
-                "staff_name": get_staff_name(int(sid)) or f"Staff {sid}",
+                "staff_name": get_staff_name(business_id, int(sid)) or f"Staff {sid}",
             }
         )
 
@@ -251,7 +303,6 @@ def find_earliest_availability(
     if not svc:
         return EarliestAvailabilityResult(ok=False, reason="invalid_service")
 
-    # Start searching from opening time of that date
     day = datetime.strptime(date_str, "%Y-%m-%d").date()
     hours = _get_business_hours(business_id, datetime.combine(day, time(12, 0)))
     if not hours:
@@ -262,36 +313,16 @@ def find_earliest_availability(
 
     cursor = datetime.combine(day, open_t)
     duration_min = int(svc["duration_min"])
-
-    ok, reason, staff_id, sdt, edt, _ = find_slot_or_suggest(
-        business_id=business_id,
-        service_id=int(svc["id"]),
-        requested_start=cursor,
-        duration_min=duration_min,
-        search_days=0,
-        step_min=15,
-        max_suggestions=1,
-    )
-
-    if ok and staff_id and sdt:
-        return EarliestAvailabilityResult(
-            ok=True,
-            reason="found",
-            staff_id=int(staff_id),
-            staff_name=get_staff_name(int(staff_id)) or f"Staff {staff_id}",
-            start_hhmm=sdt.strftime("%H:%M"),
-            start_dt=sdt,
-        )
-
-    # If the exact open time isn't free, walk the day in 15-min steps
     close_dt = datetime.combine(day, close_t)
     step = timedelta(minutes=15)
+
     while cursor + timedelta(minutes=duration_min) <= close_dt:
         ok, _, staff_id, sdt, _, _ = find_slot_or_suggest(
             business_id=business_id,
             service_id=int(svc["id"]),
             requested_start=cursor,
             duration_min=duration_min,
+            preferred_staff=preferred_staff,
             search_days=0,
             step_min=15,
             max_suggestions=1,
@@ -301,7 +332,7 @@ def find_earliest_availability(
                 ok=True,
                 reason="found",
                 staff_id=int(staff_id),
-                staff_name=get_staff_name(int(staff_id)) or f"Staff {staff_id}",
+                staff_name=get_staff_name(business_id, int(staff_id)) or f"Staff {staff_id}",
                 start_hhmm=sdt.strftime("%H:%M"),
                 start_dt=sdt,
             )
