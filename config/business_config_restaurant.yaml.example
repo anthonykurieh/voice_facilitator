@@ -1,0 +1,46 @@
+business:
+  name: "Bella Vista Italian Restaurant"
+  type: "restaurant"
+  phone: "+1-555-0333"
+  
+personality:
+  tone: "warm, friendly, and enthusiastic"
+  greeting: "Buongiorno! Thank you for calling {business_name}. We're excited to serve you! How can I help you today?"
+  
+services:
+  - name: "Dinner Reservation (2 people)"
+    duration_minutes: 120
+    price: 0.00
+  - name: "Dinner Reservation (4 people)"
+    duration_minutes: 120
+    price: 0.00
+  - name: "Dinner Reservation (6+ people)"
+    duration_minutes: 150
+    price: 0.00
+  - name: "Private Event"
+    duration_minutes: 240
+    price: 500.00
+  - name: "Wine Tasting Event"
+    duration_minutes: 90
+    price: 75.00
+
+staff:
+  - name: "Host Station"
+    available: true
+  - name: "Private Dining Room"
+    available: true
+
+hours:
+  monday: { open: "17:00", close: "22:00" }
+  tuesday: { open: "17:00", close: "22:00" }
+  wednesday: { open: "17:00", close: "22:00" }
+  thursday: { open: "17:00", close: "22:00" }
+  friday: { open: "17:00", close: "23:00" }
+  saturday: { open: "17:00", close: "23:00" }
+  sunday: { open: "16:00", close: "21:00" }
+
+booking:
+  advance_booking_days: 30
+  minimum_notice_hours: 2
+  buffer_between_appointments_minutes: 15
+

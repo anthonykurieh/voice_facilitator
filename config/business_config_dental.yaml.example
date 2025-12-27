@@ -1,0 +1,53 @@
+business:
+  name: "Bright Smile Dental Clinic"
+  type: "dental"
+  phone: "+1-555-0199"
+  
+personality:
+  tone: "professional, caring, and reassuring"
+  greeting: "Hello! Thank you for calling {business_name}. We're here to help with all your dental care needs. How can I assist you today?"
+  
+services:
+  - name: "Routine Cleaning"
+    duration_minutes: 45
+    price: 120.00
+  - name: "Dental Exam"
+    duration_minutes: 30
+    price: 85.00
+  - name: "Teeth Whitening"
+    duration_minutes: 60
+    price: 300.00
+  - name: "Filling"
+    duration_minutes: 45
+    price: 200.00
+  - name: "Root Canal"
+    duration_minutes: 90
+    price: 800.00
+  - name: "Emergency Visit"
+    duration_minutes: 30
+    price: 150.00
+
+staff:
+  - name: "Dr. Sarah Johnson"
+    available: true
+  - name: "Dr. Michael Chen"
+    available: true
+  - name: "Dr. Emily Rodriguez"
+    available: true
+  - name: "Hygienist Lisa"
+    available: true
+
+hours:
+  monday: { open: "08:00", close: "17:00" }
+  tuesday: { open: "08:00", close: "17:00" }
+  wednesday: { open: "08:00", close: "17:00" }
+  thursday: { open: "08:00", close: "17:00" }
+  friday: { open: "08:00", close: "15:00" }
+  saturday: { open: "09:00", close: "13:00" }
+  sunday: { open: null, close: null }
+
+booking:
+  advance_booking_days: 60
+  minimum_notice_hours: 24
+  buffer_between_appointments_minutes: 10
+

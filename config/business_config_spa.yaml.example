@@ -1,0 +1,53 @@
+business:
+  name: "Serenity Day Spa"
+  type: "spa"
+  phone: "+1-555-0247"
+  
+personality:
+  tone: "calm, welcoming, and luxurious"
+  greeting: "Welcome to {business_name}. Thank you for calling. We're delighted to help you relax and rejuvenate. How may I assist you today?"
+  
+services:
+  - name: "Swedish Massage"
+    duration_minutes: 60
+    price: 95.00
+  - name: "Deep Tissue Massage"
+    duration_minutes: 90
+    price: 135.00
+  - name: "Facial Treatment"
+    duration_minutes: 75
+    price: 120.00
+  - name: "Hot Stone Massage"
+    duration_minutes: 90
+    price: 150.00
+  - name: "Couples Massage"
+    duration_minutes: 90
+    price: 250.00
+  - name: "Full Day Package"
+    duration_minutes: 240
+    price: 400.00
+
+staff:
+  - name: "Maria"
+    available: true
+  - name: "James"
+    available: true
+  - name: "Sophie"
+    available: true
+  - name: "David"
+    available: true
+
+hours:
+  monday: { open: "10:00", close: "20:00" }
+  tuesday: { open: "10:00", close: "20:00" }
+  wednesday: { open: "10:00", close: "20:00" }
+  thursday: { open: "10:00", close: "20:00" }
+  friday: { open: "09:00", close: "21:00" }
+  saturday: { open: "09:00", close: "21:00" }
+  sunday: { open: "11:00", close: "18:00" }
+
+booking:
+  advance_booking_days: 90
+  minimum_notice_hours: 4
+  buffer_between_appointments_minutes: 15
+
