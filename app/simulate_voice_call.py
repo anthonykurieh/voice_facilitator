@@ -1,3 +1,5 @@
+# app/simulate_voice_call.py
+
 import uuid
 from datetime import datetime, date as _date, timedelta
 
@@ -72,9 +74,19 @@ def run_voice_call():
     # ✅ Disambiguation state
     pending_pick = None
     # example:
-    # {"purpose": "cancel"|"reschedule"|"modify_service"|"change_barber",
+    # {"purpose": "cancel_appointment"|"reschedule_appointment"|"modify_appointment",
     #  "candidates": [id...],
     #  "payload": { ...stuff from original request... }}
+
+    # ✅ Booking context memory (persists across turns)
+    booking_ctx = {
+        "service": None,
+        "date_text": None,
+        "date_iso": None,
+        "time_text": None,
+        "time_hhmm": None,
+        "preferred_staff": None,
+    }
 
     greeting = "Hello! Thanks for calling. Before we get started, can I have your name and phone number?"
     print(f"Agent: {greeting}")
@@ -103,9 +115,7 @@ def run_voice_call():
                 purpose = pending_pick["purpose"]
                 payload = pending_pick.get("payload") or {}
                 pending_pick = None
-                # “re-inject” into the normal logic by setting fields
                 payload["appointment_id"] = picked
-                # we’ll handle it by overriding entities later
                 injected_entities = payload
                 injected_intent = purpose
             else:
@@ -122,6 +132,31 @@ def run_voice_call():
         intent = injected_intent or nlu.intent
         entities = injected_entities or (nlu.entities or {})
         confidence = float(getattr(nlu, "confidence", 0.0))
+
+        # -------------------------
+        # ✅ Update booking context from extracted entities
+        # -------------------------
+        svc_e = entities.get("service", "unspecified")
+        dt_e = entities.get("date", "unspecified")
+        tm_e = entities.get("time", "unspecified")
+        ps_e = entities.get("preferred_staff", "unspecified")
+
+        if not _is_unspecified(svc_e):
+            booking_ctx["service"] = str(svc_e).strip()
+        if not _is_unspecified(dt_e):
+            booking_ctx["date_text"] = str(dt_e).strip()
+        if not _is_unspecified(tm_e):
+            booking_ctx["time_text"] = str(tm_e).strip()
+        if not _is_unspecified(ps_e):
+            booking_ctx["preferred_staff"] = str(ps_e).strip()
+
+        # ✅ If we are mid-booking and user says a date/time but intent isn't right, force schedule flow.
+        if intent not in ("schedule_appointment", "check_availability"):
+            if booking_ctx["service"] and (
+                not _is_unspecified(entities.get("date", "unspecified"))
+                or not _is_unspecified(entities.get("time", "unspecified"))
+            ):
+                intent = "schedule_appointment"
 
         # -------------------------
         # Identity gating
@@ -220,7 +255,7 @@ def run_voice_call():
                     pending_pick = {
                         "purpose": "cancel_appointment",
                         "candidates": [int(a["id"]) for a in cands],
-                        "payload": {},  # nothing else needed
+                        "payload": {},
                     }
                     print(f"Agent: {msg}")
                     log_message(call_id, "assistant", msg, intent=intent, confidence=confidence, entities=entities)
@@ -272,7 +307,6 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
 
-            # If no appt id: pick it (upcoming or by date/time)
             if appt_id is None:
                 pick = pick_appointment_for_action(business_id, customer_id)
                 if pick.ok:
@@ -299,7 +333,6 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
 
-            # ✅ INFER SERVICE from DB (no re-asking)
             service_name = appt["service_name"]
 
             slot = check_slot_and_suggest(
@@ -407,7 +440,7 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
 
-            # B) Change service (keep same start time; end time/price updated)
+            # B) Change service
             if _is_unspecified(new_service):
                 msg = "Sure — what would you like to change? You can say ‘change barber to Omar’ or ‘change service to fade’."
                 print(f"Agent: {msg}")
@@ -438,11 +471,17 @@ def run_voice_call():
             continue
 
         # -------------------------
-        # BOOKING (unchanged core)
+        # CHECK AVAILABILITY
         # -------------------------
         if intent == "check_availability":
             service = entities.get("service", "unspecified")
             date_text = entities.get("date", "unspecified")
+
+            # ✅ reuse previous info if user only gave date/service in this turn
+            if _is_unspecified(service) and booking_ctx["service"]:
+                service = booking_ctx["service"]
+            if _is_unspecified(date_text) and booking_ctx["date_text"]:
+                date_text = booking_ctx["date_text"]
 
             if _is_unspecified(service):
                 ask = "Sure — what service are you looking for? Haircut, fade, beard trim, or combo."
@@ -467,6 +506,10 @@ def run_voice_call():
                 continue
 
             date_iso = res.resolved_date
+            booking_ctx["date_iso"] = date_iso
+            booking_ctx["service"] = service
+            booking_ctx["date_text"] = date_text
+
             result = find_earliest_availability(business_id, service, date_iso, preferred_staff=None)
 
             if not result.ok:
@@ -476,17 +519,34 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
 
-            pending_proposed_slot = {"service": service, "date_iso": date_iso, "time_hhmm": result.start_hhmm, "staff_id": result.staff_id, "staff_name": result.staff_name}
+            pending_proposed_slot = {
+                "service": service,
+                "date_iso": date_iso,
+                "time_hhmm": result.start_hhmm,
+                "staff_id": result.staff_id,
+                "staff_name": result.staff_name,
+            }
             msg = f"Earliest for a {service} is {result.start_hhmm} with {result.staff_name} on {date_iso}. Want me to book it?"
             print(f"Agent: {msg}")
             log_message(call_id, "assistant", msg, intent=intent, confidence=confidence, entities=entities)
             tts.speak(msg)
             continue
 
+        # -------------------------
+        # SCHEDULE APPOINTMENT
+        # -------------------------
         if intent == "schedule_appointment":
             service = entities.get("service", "unspecified")
             date_text = entities.get("date", "unspecified")
             time_text = entities.get("time", "unspecified")
+
+            # ✅ reuse previous values if user replies with partial info
+            if _is_unspecified(service) and booking_ctx["service"]:
+                service = booking_ctx["service"]
+            if _is_unspecified(date_text) and booking_ctx["date_text"]:
+                date_text = booking_ctx["date_text"]
+            if _is_unspecified(time_text) and booking_ctx["time_text"]:
+                time_text = booking_ctx["time_text"]
 
             if pending_proposed_slot and any(x in user_text.lower() for x in ["yes", "confirm", "book", "sure", "okay"]):
                 appt = pending_proposed_slot
@@ -515,14 +575,19 @@ def run_voice_call():
                 )
                 pending_proposed_slot = None
 
+                # reset booking memory after successful booking
+                booking_ctx["date_text"] = None
+                booking_ctx["date_iso"] = None
+                booking_ctx["time_text"] = None
+                booking_ctx["time_hhmm"] = None
+                booking_ctx["preferred_staff"] = None
+
                 msg = f"All set — booked {svc['name']} at {appt['time_hhmm']} with {appt['staff_name']} on {appt['date_iso']}. Anything else?"
                 print(f"Agent: {msg}")
                 log_message(call_id, "assistant", msg, intent=intent, confidence=confidence, entities=entities)
                 tts.speak(msg)
                 continue
 
-            # If user said "haircut tomorrow" and model gave a vague reply:
-            # we enforce a real flow.
             if _is_unspecified(service):
                 ask = "Which service did you want? Haircut, fade, beard trim, or combo."
                 print(f"Agent: {ask}")
@@ -537,6 +602,9 @@ def run_voice_call():
                 tts.speak(ask)
                 continue
 
+            booking_ctx["service"] = service
+            booking_ctx["date_text"] = date_text
+
             res = resolve_date(date_text, today=_date.today())
             if res.is_ambiguous:
                 msg = res.clarification_prompt
@@ -545,11 +613,20 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
             date_iso = res.resolved_date
+            booking_ctx["date_iso"] = date_iso
 
             if _is_unspecified(time_text):
                 earliest = find_earliest_availability(business_id, service, date_iso, preferred_staff=None)
                 if earliest.ok:
-                    pending_proposed_slot = {"service": service, "date_iso": date_iso, "time_hhmm": earliest.start_hhmm, "staff_id": earliest.staff_id, "staff_name": earliest.staff_name}
+                    pending_proposed_slot = {
+                        "service": service,
+                        "date_iso": date_iso,
+                        "time_hhmm": earliest.start_hhmm,
+                        "staff_id": earliest.staff_id,
+                        "staff_name": earliest.staff_name,
+                    }
+                    booking_ctx["time_text"] = None
+                    booking_ctx["time_hhmm"] = earliest.start_hhmm
                     msg = f"What time works? Earliest is {earliest.start_hhmm} with {earliest.staff_name}. Want that?"
                 else:
                     msg = "What time would you like? For example: 4 PM or 16:30."
@@ -566,9 +643,24 @@ def run_voice_call():
                 tts.speak(msg)
                 continue
 
-            slot = check_slot_and_suggest(business_id, service, date_iso, time_hhmm, preferred_staff=None, max_alternatives=3)
+            booking_ctx["time_hhmm"] = time_hhmm
+
+            slot = check_slot_and_suggest(
+                business_id,
+                service,
+                date_iso,
+                time_hhmm,
+                preferred_staff=None,
+                max_alternatives=3,
+            )
             if slot.ok:
-                pending_proposed_slot = {"service": service, "date_iso": date_iso, "time_hhmm": time_hhmm, "staff_id": slot.staff_id, "staff_name": slot.staff_name}
+                pending_proposed_slot = {
+                    "service": service,
+                    "date_iso": date_iso,
+                    "time_hhmm": time_hhmm,
+                    "staff_id": slot.staff_id,
+                    "staff_name": slot.staff_name,
+                }
                 msg = f"Yes — {time_hhmm} on {date_iso} with {slot.staff_name}. Confirm?"
             else:
                 if slot.alternatives:
