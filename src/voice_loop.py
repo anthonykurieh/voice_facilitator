@@ -9,6 +9,7 @@ from src.agent import Agent
 from src.tools import BackendTools
 from src.config_loader import ConfigLoader
 from src.database import Database
+from src.init_database import init_business_data
 
 # Set up logging
 logging.basicConfig(
@@ -42,11 +43,20 @@ class VoiceLoop:
         self.agent = Agent(OPENAI_API_KEY, self.config, self.database, self.tools)
         self.stt = SpeechToText(OPENAI_API_KEY)
         self.tts = TextToSpeech(OPENAI_API_KEY)
+        self.call_id = None
+        self.call_transcript = []
+        self.call_outcome = None
+        self.call_customer_id = None
+        self.call_appointment_id = None
         
         # Initialize database schema
         logger.info("Initializing database...")
         print("Initializing database...")
         self.database.initialize_schema()
+        try:
+            init_business_data()
+        except Exception as e:
+            logger.warning(f"Business data initialization skipped: {e}")
         
         # Initialize business data if needed
         # (Run init_database.py separately for first-time setup)
@@ -58,11 +68,19 @@ class VoiceLoop:
         print("\n" + "="*60)
         print("Voice Assistant Starting...")
         print("="*60 + "\n")
+
+        # Start call record
+        try:
+            self.call_id = self.database.create_call(business_id=1)
+            logger.info(f"Call started with id {self.call_id}")
+        except Exception as e:
+            logger.warning(f"Could not create call record: {e}")
         
         # Greeting
         greeting = self.agent.get_greeting()
         print(f"Assistant: {greeting}")
         self.tts.speak(greeting)
+        self._log_turn("assistant", greeting)
         
         # Main loop
         conversation_complete = False
@@ -82,6 +100,7 @@ class VoiceLoop:
                 
                 logger.info(f"User said: {user_input}")
                 print(f"\nUser: {user_input}")
+                self._log_turn("user", user_input)
                 
                 # Think
                 logger.info("Processing user input with agent...")
@@ -94,6 +113,7 @@ class VoiceLoop:
                 
                 logger.info(f"Assistant response: {response_text}")
                 print(f"Assistant: {response_text}")
+                self._log_turn("assistant", response_text)
                 
                 # Act (if action needed)
                 action = agent_decision.get('action')
@@ -108,6 +128,19 @@ class VoiceLoop:
                         action_result = self.agent.execute_action(action, action_params)
                         logger.info(f"Action result: {action_result}")
                         print(f"[Action result: {action_result}]")
+                        # Capture booking outcome
+                        if action == 'book_appointment' and action_result.get('success'):
+                            self.call_outcome = self.call_outcome or 'booked'
+                            if action_result.get('customer_id'):
+                                self.call_customer_id = action_result.get('customer_id')
+                            if action_result.get('appointment_id'):
+                                self.call_appointment_id = action_result.get('appointment_id')
+                        if action == 'cancel_appointment' and action_result.get('success'):
+                            self.call_outcome = self.call_outcome or 'cancelled'
+                        if action == 'reschedule_appointment' and action_result.get('success'):
+                            self.call_outcome = self.call_outcome or 'rescheduled'
+                            if action_result.get('new_appointment_id'):
+                                self.call_appointment_id = action_result.get('new_appointment_id')
                         
                         # Incorporate action result into conversation
                         if action_result.get('error'):
@@ -148,7 +181,7 @@ class VoiceLoop:
                             response_text = closed_feedback.get('response', response_text)
                             logger.info(f"Assistant response for closed day: {response_text}")
                             print(f"Assistant (closed day): {response_text}")
-                        elif action_result.get('success') or action_result.get('appointments') or action_result.get('available_slots'):
+                        elif action_result.get('success') or action_result.get('appointments') or action_result.get('available_slots') or action == 'reschedule_appointment':
                             logger.info("Action completed successfully")
                             # If availability check returned slots, inform agent and prompt to book
                             if action == 'check_availability' and action_result.get('count', 0) > 0:
@@ -219,6 +252,41 @@ class VoiceLoop:
                                 response_text = confirm_feedback.get('response', response_text)
                                 logger.info(f"Assistant response after booking: {response_text}")
                                 print(f"Assistant (booking confirmed): {response_text}")
+                            elif action == 'reschedule_appointment':
+                                if action_result.get('requires_new_slot'):
+                                    apt = action_result.get('appointment', {})
+                                    reschedule_prompt = (
+                                        f"The customer wants to reschedule. Current appointment: "
+                                        f"{apt.get('date')} at {apt.get('time')} "
+                                        f"(Service: {apt.get('service')}, Staff: {apt.get('staff')}). "
+                                        f"Ask the customer for a new date and time, or offer to check the closest availability."
+                                    )
+                                    reschedule_feedback = self.agent.process(reschedule_prompt)
+                                    response_text = reschedule_feedback.get('response', response_text)
+                                    logger.info(f"Assistant response requesting new slot: {response_text}")
+                                    print(f"Assistant (reschedule prompt): {response_text}")
+                                elif action_result.get('requires_new_time'):
+                                    available_slots = action_result.get('available_slots', [])
+                                    date_str = action_result.get('date')
+                                    day_name = action_result.get('day_name', 'that day')
+                                    slots_prompt = (
+                                        f"Reschedule availability for {day_name} ({date_str}): "
+                                        f"{', '.join(available_slots[:10]) if available_slots else 'No slots'}. "
+                                        f"Ask the customer to pick a time, or offer to check another day."
+                                    )
+                                    slots_feedback = self.agent.process(slots_prompt)
+                                    response_text = slots_feedback.get('response', response_text)
+                                    logger.info(f"Assistant response with reschedule slots: {response_text}")
+                                    print(f"Assistant (reschedule slots): {response_text}")
+                                elif action_result.get('success'):
+                                    reschedule_confirmation = (
+                                        f"Appointment rescheduled. New time: {action_result.get('new_date')} at {action_result.get('new_time')}. "
+                                        f"Confirm the change with the customer and thank them."
+                                    )
+                                    reschedule_feedback = self.agent.process(reschedule_confirmation)
+                                    response_text = reschedule_feedback.get('response', response_text)
+                                    logger.info(f"Assistant response after reschedule: {response_text}")
+                                    print(f"Assistant (rescheduled): {response_text}")
                             elif action == 'get_customer_appointments' and action_result.get('appointments'):
                                 # Customer appointments retrieved - inform agent to share details
                                 appointments = action_result.get('appointments', [])
@@ -295,9 +363,11 @@ class VoiceLoop:
         closing = "Thank you for calling. Have a great day!"
         print(f"\nAssistant: {closing}")
         self.tts.speak(closing)
+        self._log_turn("assistant", closing)
         
         # Cleanup
         self.cleanup()
+        self._finalize_call(conversation_complete)
     
     def cleanup(self):
         """Clean up resources."""
@@ -306,6 +376,31 @@ class VoiceLoop:
         self.stt.cleanup()
         logger.info("Voice assistant stopped.")
         print("Voice assistant stopped.")
+
+    def _log_turn(self, role: str, text: str):
+        """Append a turn to call transcript."""
+        if text is None:
+            return
+        self.call_transcript.append({"role": role, "text": text})
+
+    def _finalize_call(self, conversation_complete: bool):
+        """Persist call transcript and outcome."""
+        if not self.call_id:
+            return
+        outcome = self.call_outcome or ("completed" if conversation_complete else "inquiry")
+        try:
+            import json
+            transcript_str = json.dumps(self.call_transcript)
+            self.database.finalize_call(
+                self.call_id,
+                outcome=outcome,
+                transcript=transcript_str,
+                customer_id=self.call_customer_id,
+                appointment_id=self.call_appointment_id
+            )
+            logger.info(f"Call {self.call_id} finalized with outcome {outcome}")
+        except Exception as e:
+            logger.warning(f"Failed to finalize call {self.call_id}: {e}")
 
 
 def main():
@@ -324,4 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

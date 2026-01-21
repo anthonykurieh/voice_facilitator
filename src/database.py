@@ -147,7 +147,73 @@ class Database:
                     FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL
                 )
             """)
+            # Add appointment_id link if missing (best effort)
+            try:
+                cursor.execute("""
+                    ALTER TABLE calls
+                    ADD COLUMN IF NOT EXISTS appointment_id INT NULL
+                """)
+                cursor.execute("""
+                    ALTER TABLE calls
+                    ADD CONSTRAINT IF NOT EXISTS fk_calls_appointment
+                    FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE SET NULL
+                """)
+            except Exception:
+                # MySQL <8 may not support IF NOT EXISTS on ALTER; ignore if already exists
+                try:
+                    cursor.execute("ALTER TABLE calls ADD COLUMN appointment_id INT NULL")
+                except Exception:
+                    pass
             
+            # KPI events table (captures snapshots for analytics)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS kpi_events (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    appointment_id INT,
+                    event_type VARCHAR(50), -- booked, cancelled, reschedule_new, reschedule_cancel_old
+                    service_id INT NULL,
+                    service_name VARCHAR(255),
+                    service_price DECIMAL(10,2) NULL,
+                    staff_id INT NULL,
+                    staff_name VARCHAR(255),
+                    duration_minutes INT,
+                    status VARCHAR(50),
+                    appointment_date DATE,
+                    appointment_time TIME,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE SET NULL
+                )
+            """)
+            
+            conn.commit()
+
+    def create_call(self, business_id: int = 1, customer_id: Optional[int] = None) -> int:
+        """Create a call record and return its ID."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO calls (business_id, customer_id)
+                VALUES (%s, %s)
+            """, (business_id, customer_id))
+            conn.commit()
+            return cursor.lastrowid
+
+    def finalize_call(self, call_id: int, outcome: Optional[str] = None,
+                      transcript: Optional[str] = None,
+                      customer_id: Optional[int] = None,
+                      appointment_id: Optional[int] = None) -> None:
+        """Update call with outcome, transcript, linked customer/appointment, and end time."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE calls
+                SET ended_at = CURRENT_TIMESTAMP,
+                    outcome = COALESCE(%s, outcome),
+                    transcript = COALESCE(%s, transcript),
+                    customer_id = COALESCE(%s, customer_id),
+                    appointment_id = COALESCE(%s, appointment_id)
+                WHERE id = %s
+            """, (outcome, transcript, customer_id, appointment_id, call_id))
             conn.commit()
     
     def get_available_slots(self, date: date, staff_id: Optional[int] = None, 
@@ -257,7 +323,9 @@ class Database:
     def create_appointment(self, business_id: int, customer_id: Optional[int],
                           staff_id: Optional[int], service_id: Optional[int],
                           appointment_date: date, appointment_time: time,
-                          duration_minutes: int, notes: Optional[str] = None) -> int:
+                          duration_minutes: int, notes: Optional[str] = None,
+                          service_name: Optional[str] = None,
+                          service_price: Optional[float] = None) -> int:
         """Create a new appointment.
         
         CRITICAL: This function checks for conflicts before booking to prevent double-booking.
@@ -335,6 +403,20 @@ class Database:
                 f"Successfully created appointment {appointment_id} "
                 f"for {appointment_date} at {appointment_time}"
             )
+
+            # Snapshot KPI event for analytics
+            self._log_kpi_event(
+                appointment_id=appointment_id,
+                event_type="booked",
+                service_id=service_id,
+                service_name=service_name,
+                service_price=service_price,
+                staff_id=staff_id,
+                duration_minutes=duration_minutes,
+                status="scheduled",
+                appointment_date=appointment_date,
+                appointment_time=appointment_time
+            )
             return appointment_id
     
     def get_customer_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
@@ -396,11 +478,145 @@ class Database:
         """Cancel an appointment."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # Capture snapshot before update for KPI logging
+            cursor.execute("""
+                SELECT appointment_date, appointment_time, duration_minutes, service_id, staff_id, status
+                FROM appointments
+                WHERE id = %s
+            """, (appointment_id,))
+            before = cursor.fetchone()
+
             cursor.execute("""
                 UPDATE appointments 
                 SET status = 'cancelled' 
                 WHERE id = %s
             """, (appointment_id,))
             conn.commit()
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
 
+            if success:
+                self._log_kpi_event(
+                    appointment_id=appointment_id,
+                    event_type="cancelled",
+                    service_id=before.get("service_id") if before else None,
+                    staff_id=before.get("staff_id") if before else None,
+                    duration_minutes=before.get("duration_minutes") if before else None,
+                    status="cancelled",
+                    appointment_date=before.get("appointment_date") if before else None,
+                    appointment_time=before.get("appointment_time") if before else None
+                )
+            return success
+
+    def get_service_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Fetch a service by name (case-insensitive)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, duration_minutes, price 
+                FROM services 
+                WHERE LOWER(name) = LOWER(%s) AND active = TRUE
+                LIMIT 1
+            """, (name,))
+            return cursor.fetchone()
+
+    def get_service_by_id(self, service_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a service by id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, duration_minutes, price
+                FROM services
+                WHERE id = %s
+                LIMIT 1
+            """, (service_id,))
+            return cursor.fetchone()
+
+    def get_staff_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Fetch a staff member by name (case-insensitive)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, available 
+                FROM staff 
+                WHERE LOWER(name) = LOWER(%s)
+                LIMIT 1
+            """, (name,))
+            return cursor.fetchone()
+
+    def get_staff_by_id(self, staff_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a staff member by id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, available
+                FROM staff
+                WHERE id = %s
+                LIMIT 1
+            """, (staff_id,))
+            return cursor.fetchone()
+
+    def get_available_staff(self) -> List[Dict[str, Any]]:
+        """Return available staff ordered by id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, available
+                FROM staff
+                WHERE available = TRUE
+                ORDER BY id ASC
+            """)
+            return cursor.fetchall()
+
+    def get_appointment_by_id(self, appointment_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a single appointment with service/staff details."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT a.*, s.name as service_name, st.name as staff_name, s.duration_minutes as service_duration
+                FROM appointments a
+                LEFT JOIN services s ON a.service_id = s.id
+                LEFT JOIN staff st ON a.staff_id = st.id
+                WHERE a.id = %s
+            """, (appointment_id,))
+            return cursor.fetchone()
+
+    def _log_kpi_event(self, appointment_id: int, event_type: str,
+                       service_id: Optional[int] = None,
+                       staff_id: Optional[int] = None,
+                       duration_minutes: Optional[int] = None,
+                       status: Optional[str] = None,
+                       appointment_date: Optional[date] = None,
+                       appointment_time: Optional[time] = None,
+                       service_name: Optional[str] = None,
+                       service_price: Optional[float] = None) -> None:
+        """Log KPI snapshot for analytics."""
+        try:
+            staff_name = None
+
+            if service_id and (service_name is None or service_price is None or duration_minutes is None):
+                svc = self.get_service_by_id(service_id)
+                if svc:
+                    service_name = service_name or svc.get("name")
+                    service_price = service_price if service_price is not None else svc.get("price")
+                    duration_minutes = duration_minutes or svc.get("duration_minutes")
+
+            if staff_id:
+                staff = self.get_staff_by_id(staff_id)
+                if staff:
+                    staff_name = staff.get("name")
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO kpi_events
+                    (appointment_id, event_type, service_id, service_name, service_price,
+                     staff_id, staff_name, duration_minutes, status, appointment_date, appointment_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    appointment_id, event_type, service_id, service_name, service_price,
+                    staff_id, staff_name, duration_minutes, status, appointment_date, appointment_time
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to log KPI event for appointment {appointment_id}: {e}")

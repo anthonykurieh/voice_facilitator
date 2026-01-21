@@ -53,37 +53,37 @@ class SpeechToText:
         # sounddevice returns float32 in range [-1.0, 1.0]
         return np.abs(audio_data).mean()
     
-    def calibrate(self, duration: float = 2.0):
-        """Calibrate noise level from ambient sound.
+    def calibrate(self, duration: float = 1.0):
+        """Calibrate noise level from ambient sound using short, robust stats (median/percentile).
         
-        Args:
-            duration: Seconds to sample for calibration
+        Shorter calibration reduces user wait; median/percentile helps in noisy spaces (energy-based VAD best practice).
         """
         print("Calibrating noise level... (please be quiet)")
         
-        # Record ambient sound
         recording = sd.rec(
             int(duration * self.sample_rate),
             samplerate=self.sample_rate,
             channels=self.channels,
             dtype='float32'
         )
-        sd.wait()  # Wait until recording is finished
+        sd.wait()
         
-        # Calculate energy for each frame
-        frame_size = self.chunk_size
         energies = []
+        frame_size = self.chunk_size
         for i in range(0, len(recording), frame_size):
             chunk = recording[i:i+frame_size]
             if len(chunk) > 0:
-                energy = self._calculate_energy(chunk.flatten())
-                energies.append(energy)
+                energies.append(self._calculate_energy(chunk.flatten()))
         
-        # Calculate ambient noise level
-        ambient_energy = np.mean(energies) if energies else self.energy_floor
+        if not energies:
+            ambient_energy = self.energy_floor
+        else:
+            ambient_energy = np.median(energies)
+            perc95 = np.percentile(energies, 95)
+            ambient_energy = max(ambient_energy, perc95 * 0.5)
         
-        # Set start threshold: clamp between floor and ceil, or use ambient * 2
-        start_thresh = max(ambient_energy * 2, self.energy_floor)
+        start_thresh = ambient_energy * 2.5
+        start_thresh = max(start_thresh, self.energy_floor)
         start_thresh = min(start_thresh, self.energy_ceil)
         
         self.start_threshold = start_thresh
@@ -113,7 +113,9 @@ class SpeechToText:
             'silence_start': None,
             'speech_detected': False,
             'recording_start': time.time(),
-            'should_stop': False
+            'should_stop': False,
+            # Seed adaptive noise floor from calibration; updated in callback
+            'noise_floor': (self.start_threshold or self.energy_floor) / 2.5
         }
         
         def audio_callback(indata, frames, time_info, status):
@@ -126,9 +128,18 @@ class SpeechToText:
             
             # Calculate energy
             energy = self._calculate_energy(indata.flatten())
+            
+            # Adaptive noise floor (EMA) to follow changing ambient noise; common lightweight VAD technique
+            if not callback_state['speech_detected']:
+                callback_state['noise_floor'] = 0.9 * callback_state['noise_floor'] + 0.1 * energy
+                dynamic_start = max(callback_state['noise_floor'] * 3.0, self.energy_floor)
+                dynamic_start = min(dynamic_start, self.energy_ceil)
+                self.start_threshold = dynamic_start
+                self.stop_threshold = self.start_threshold * self.stop_threshold_ratio
+            
             recording_frames.append(indata.copy())
             
-            # Detect speech using start threshold
+            # Detect speech using adaptive start threshold
             if energy > self.start_threshold:
                 callback_state['speech_detected'] = True
                 callback_state['silence_start'] = None
@@ -226,4 +237,3 @@ class SpeechToText:
     def cleanup(self):
         """Clean up resources."""
         self.stop()
-

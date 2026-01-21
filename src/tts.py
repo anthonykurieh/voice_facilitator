@@ -48,8 +48,8 @@ class TextToSpeech:
             
             # Save to temporary file
             with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_file:
-                tmp_file.write(response.content)
                 tmp_path = tmp_file.name
+            response.stream_to_file(tmp_path)
             
             # Play audio
             try:
@@ -96,4 +96,3 @@ class TextToSpeech:
         thread.daemon = True
         thread.start()
         return thread
-
