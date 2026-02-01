@@ -6,7 +6,8 @@ from openai import OpenAI
 from datetime import datetime, date, time
 import re
 from dateutil.tz import gettz
-from src.config import DIALOG_MODEL, APP_TIMEZONE
+from src.config import DIALOG_MODEL, APP_TIMEZONE, TRANSLATE_MODEL
+from src.translation import Translator
 
 
 class Agent:
@@ -25,6 +26,8 @@ class Agent:
         self.config = config
         self.database = database
         self.tools = tools
+        self.translator = Translator(self.client, TRANSLATE_MODEL)
+        self.last_user_language = "en"
         
         self.conversation_history: List[Dict[str, str]] = []
         self.state: Dict[str, Any] = {
@@ -103,6 +106,8 @@ CONVERSATION GUIDELINES:
 - If information is ambiguous, ask ONE clarifying question, then proceed
 - Don't get stuck in clarification loops
 - Handle messy, incomplete, or grammatically incorrect speech naturally
+- Always respond in English. A translation layer will localize responses if needed
+- Preserve accents and proper spelling; do not replace accented characters with numbers or ASCII-only text
 - Always collect and confirm the customer's phone number and name before booking
 - For rescheduling: ask for the customer's phone number, fetch their upcoming appointment, repeat the current slot, then ask for a new date/time or offer the nearest available slots before rescheduling
 - When availability is confirmed, PROCEED TO BOOK - don't keep checking availability
@@ -110,12 +115,28 @@ CONVERSATION GUIDELINES:
 - DO NOT check availability multiple times for the same request - if availability is confirmed, book it
 - If the customer says "yes", "okay", or confirms, and you have availability, BOOK IT - don't check again
 
+LIGHTWEIGHT GUARDRAILS (keep it friendly and flexible):
+- If phone number is unclear, too short/long, or missing digits, ask them to repeat it slowly (accept spoken digits like "double two", "oh" = 0)
+- If name is unclear, ask for a quick spelling or last name (but accept a first name if they insist)
+- If date is vague ("sometime next week"), ask for a specific day; if time is vague ("morning"), offer 2-3 options
+- If service is missing, suggest the top 2-3 common services and ask them to pick
+- Always read back the final date/time in clear format and ask for confirmation before booking
+
+FLOW IMPROVEMENTS:
+- Keep turns short and conversational; avoid long speeches
+- Ask only one question at a time
+- Use quick acknowledgements ("Got it", "Perfect") before the next question
+- If the customer agrees to a suggested time ("that works", "sounds good"), treat it as confirmation
+- When presenting options, give 2-3 choices max
+- End with a concise recap and next steps after booking
+
 DATE & TIME UNDERSTANDING:
 - Today is {current_day_name}, {current_date_str}. Current local time: {current_time_str} ({APP_TIMEZONE}). Use this for interpreting "today/tomorrow/next Monday".
 - Understand natural language: "tomorrow", "this Monday" (upcoming Monday, including today if today is Monday), "next week", "the 28th", "around 10", "in the morning"
 - "this [day]" means the upcoming occurrence of that day (including today if today is that day)
 - Dates without explicit years use the current year ({today.year})
 - Parse dates and times from conversational speech
+- When speaking times to customers, use 12-hour format like "4:30 PM" (not "16:30")
 - If ambiguous, ask once, then make a reasonable assumption
 
 RESPONSE FORMAT:
@@ -184,10 +205,17 @@ IMPORTANT:
         Returns:
             Agent decision with response, action, and state
         """
+        # Detect language and translate to English for the agent
+        detected_lang = self.translator.detect_language(user_input)
+        self.last_user_language = detected_lang or "en"
+        translated_input = user_input
+        if self.last_user_language != "en":
+            translated_input = self.translator.translate(user_input, "en")
+
         # Add user input to history
         self.conversation_history.append({
             "role": "user",
-            "content": user_input
+            "content": translated_input
         })
         
         # Build messages for API
@@ -206,17 +234,24 @@ IMPORTANT:
             )
             
             agent_response = json.loads(response.choices[0].message.content)
+            response_text = agent_response.get("response", "")
+            translated_response = response_text
+            if self.last_user_language != "en":
+                translated_response = self.translator.translate(response_text, self.last_user_language)
             
             # Add assistant response to history
+            history_response = dict(agent_response)
+            history_response["response"] = response_text
             self.conversation_history.append({
                 "role": "assistant",
-                "content": json.dumps(agent_response)
+                "content": json.dumps(history_response)
             })
             
             # Update state
             if agent_response.get('state_update'):
                 self.state.update(agent_response['state_update'])
             
+            agent_response["response"] = translated_response
             return agent_response
         
         except json.JSONDecodeError as e:

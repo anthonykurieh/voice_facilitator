@@ -6,8 +6,10 @@ Usage:
 
 The app will listen on http://127.0.0.1:8050 by default.
 """
+import calendar as cal
+import json
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 # Stub bottleneck if compiled wheel conflicts with NumPy >=2
@@ -20,9 +22,11 @@ sys.modules.setdefault("bottleneck", types.SimpleNamespace(__name__="bottleneck"
 os.environ.setdefault("PANDAS_NO_BOTTLENECK", "1")
 
 import pandas as pd
+import numpy as np
+import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, dcc, html
-from dash.dependencies import Input, Output, State
+from dash import Dash, dcc, html, callback_context
+from dash.dependencies import Input, Output, State, ALL
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import Engine
@@ -81,6 +85,28 @@ def time_delta_minutes(value):
     return 0
 
 
+def coerce_time_value(value):
+    if pd.isna(value):
+        return pd.NaT
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, time):
+        return datetime.combine(date(1900, 1, 1), value)
+    if isinstance(value, (pd.Timedelta, np.timedelta64)):
+        td = pd.to_timedelta(value, errors="coerce")
+        if pd.isna(td):
+            return pd.NaT
+        return datetime(1900, 1, 1) + td
+    if isinstance(value, str) and "day" in value:
+        td = pd.to_timedelta(value, errors="coerce")
+        if pd.notna(td):
+            return datetime(1900, 1, 1) + td
+    try:
+        return pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
 def load_data(engine: Engine, start: Optional[date] = None, end: Optional[date] = None):
     today = date.today()
     start = start or (today - timedelta(days=89))
@@ -136,13 +162,13 @@ def compute_metrics(appts, calls, hours, kpis):
         return df.loc[mask].shape[0]
 
     appts["appointment_date"] = pd.to_datetime(appts["appointment_date"])
-    appts["appointment_time"] = pd.to_datetime(appts["appointment_time"], errors="coerce")
+    appts["appointment_time"] = appts["appointment_time"].apply(coerce_time_value)
     appts["created_at"] = pd.to_datetime(appts["created_at"], errors="coerce")
     kpis["created_at"] = pd.to_datetime(kpis.get("created_at"))
     if "appointment_date" in kpis.columns:
         kpis["appointment_date"] = pd.to_datetime(kpis["appointment_date"], errors="coerce")
     if "appointment_time" in kpis.columns:
-        kpis["appointment_time"] = pd.to_datetime(kpis["appointment_time"], errors="coerce")
+        kpis["appointment_time"] = kpis["appointment_time"].apply(coerce_time_value)
 
     bookings_7 = window_count(last_7, today, appts, status="scheduled")
     bookings_prev = window_count(prev_7_start, prev_7_end, appts, status="scheduled")
@@ -310,6 +336,198 @@ def build_figures(metrics):
     return fig_bookings, fig_revenue, fig_svc, fig_staff, fig_svc_pie, fig_staff_pie
 
 
+def _normalize_calendar_appts(appts):
+    appts = appts.copy()
+    appts["appointment_date"] = pd.to_datetime(appts["appointment_date"], errors="coerce")
+    appts["appointment_time"] = appts["appointment_time"].apply(coerce_time_value)
+    appts["staff_name"] = appts["staff_name"].fillna("Unassigned")
+    appts["service_name"] = appts["service_name"].fillna("Service")
+    appts["service_name"] = appts["service_name"].replace({"Unknown": "Service"})
+    appts["status"] = appts["status"].fillna("scheduled")
+    duration = pd.to_numeric(appts["duration_minutes"], errors="coerce")
+    if "service_duration" in appts.columns:
+        duration = duration.fillna(pd.to_numeric(appts["service_duration"], errors="coerce"))
+    appts["duration_minutes"] = duration.fillna(30)
+    appts["event_id"] = appts.apply(
+        lambda row: str(row["id"]) if pd.notna(row.get("id")) else f"row-{row.name}",
+        axis=1,
+    )
+    return appts
+
+
+def build_time_options():
+    options = [{"label": "All day", "value": ""}]
+    start_hour = 6
+    end_hour = 21
+    for hour in range(start_hour, end_hour + 1):
+        for minute in (0, 30):
+            label = datetime(2000, 1, 1, hour, minute).strftime("%I:%M %p").lstrip("0")
+            value = f"{hour:02d}:{minute:02d}"
+            options.append({"label": label, "value": value})
+    return options
+
+
+def _format_time(value):
+    if pd.isna(value):
+        return "TBD"
+    try:
+        return pd.to_datetime(value).strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return "TBD"
+
+
+def build_month_view(appts):
+    if appts.empty:
+        return html.Div("No appointments available.", className="calendar-empty")
+
+    appts = _normalize_calendar_appts(appts)
+    today = date.today()
+    year = today.year
+    month = today.month
+    appts = appts[appts["appointment_date"].dt.month == month]
+    appts = appts[appts["appointment_date"].dt.year == year]
+    appts = appts[appts["status"].isin(["scheduled", "completed"])]
+    appts = appts.sort_values("appointment_time")
+
+    day_events = {}
+    for _, row in appts.iterrows():
+        day_key = row["appointment_date"].date()
+        label = f"{_format_time(row['appointment_time'])} {row['service_name']}"
+        day_events.setdefault(day_key, []).append(
+            {"label": label, "event_id": row["event_id"]}
+        )
+
+    weeks = cal.monthcalendar(year, month)
+    head = html.Div(
+        [html.Div(day, className="cal-head") for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]],
+        className="cal-head-row",
+    )
+    cells = []
+    for week in weeks:
+        for day in week:
+            if day == 0:
+                cells.append(html.Div("", className="cal-cell cal-empty"))
+                continue
+            day_date = date(year, month, day)
+            events = day_events.get(day_date, [])
+            chips = [
+                html.Button(
+                    evt["label"],
+                    id={"type": "cal-event", "index": evt["event_id"]},
+                    n_clicks=0,
+                    className="cal-chip-btn",
+                )
+                for evt in events[:2]
+            ]
+            more_count = len(events) - len(chips)
+            if more_count > 0:
+                chips.append(html.Div(f"+{more_count} more", className="cal-more"))
+            cells.append(html.Div([
+                html.Div(str(day), className="cal-day"),
+                html.Div(chips, className="cal-events"),
+            ], className="cal-cell"))
+    return html.Div([
+        html.Div(f"{cal.month_name[month]} {year}", className="calendar-title"),
+        head,
+        html.Div(cells, className="calendar-grid"),
+    ], className="calendar-wrap")
+
+
+def build_day_view(appts, selected_date=None, selected_time=None):
+    if selected_date:
+        target_date = pd.to_datetime(selected_date).date()
+    else:
+        target_date = date.today()
+    if appts.empty:
+        return html.Div("No appointments available.", className="calendar-empty")
+
+    appts = _normalize_calendar_appts(appts)
+    appts = appts[appts["appointment_date"].dt.date == target_date].copy()
+    if selected_time:
+        try:
+            time_value = datetime.strptime(selected_time, "%H:%M").time()
+            appts = appts[
+                (appts["appointment_time"].dt.hour == time_value.hour)
+                & (appts["appointment_time"].dt.minute == time_value.minute)
+            ]
+        except ValueError:
+            pass
+    if appts.empty:
+        return html.Div("No appointments scheduled.", className="calendar-empty")
+
+    appts["start_time"] = appts["appointment_time"].dt.strftime("%I:%M %p").fillna("TBD")
+    appts = appts.sort_values("appointment_time")
+    items = []
+    for _, row in appts.iterrows():
+        items.append(html.Button([
+            html.Div(row["start_time"], className="day-time"),
+            html.Div([
+                html.Div(row["service_name"], className="day-title"),
+                html.Div(f"{row['staff_name']} • {row['status']}", className="day-subtitle"),
+            ], className="day-details"),
+        ], id={"type": "cal-event", "index": row["event_id"]}, n_clicks=0, className="day-item-btn"))
+    return html.Div(items, className="day-list")
+
+
+def build_calendar_views(metrics):
+    appts = metrics["appts"].copy()
+    if appts.empty:
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(text="No appointments in range", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+        empty_fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+        month_view = html.Div("No appointments available.", className="calendar-empty")
+        day_view = html.Div("No appointments available.", className="calendar-empty")
+        return empty_fig, month_view, day_view
+
+    appts = _normalize_calendar_appts(appts)
+    date_str = appts["appointment_date"].dt.date.astype(str)
+    time_str = appts["appointment_time"].dt.time.astype(str)
+    start = pd.to_datetime(date_str + " " + time_str, errors="coerce")
+    start = start.fillna(pd.to_datetime(appts["appointment_date"].dt.date))
+    appts["start"] = start
+    appts["end"] = appts["start"] + pd.to_timedelta(appts["duration_minutes"], unit="m")
+
+    timeline_df = appts[appts["status"].isin(["scheduled", "completed"])].copy()
+    if timeline_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No scheduled or completed appointments.", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+        fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+    else:
+        fig = px.timeline(
+            timeline_df,
+            x_start="start",
+            x_end="end",
+            y="staff_name",
+            color="status",
+            hover_data=["service_name"],
+        )
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+
+    month_view = build_month_view(appts)
+    day_view = build_day_view(appts, date.today())
+    return fig, month_view, day_view
+
+
+def build_calendar_payload(appts):
+    appts = _normalize_calendar_appts(appts)
+    payload = appts[[
+        "event_id",
+        "id",
+        "appointment_date",
+        "appointment_time",
+        "duration_minutes",
+        "status",
+        "service_name",
+        "staff_name",
+        "service_duration",
+    ]].copy()
+    payload["appointment_date"] = appts["appointment_date"].dt.date.astype(str)
+    payload["appointment_time"] = appts["appointment_time"].dt.strftime("%H:%M:%S")
+    payload = payload.replace({np.nan: None})
+    return payload
+
+
 def serve_layout(metrics, figs, start_date=None, end_date=None):
     bookings_delta = ((metrics["bookings_7"] - metrics["bookings_prev"]) / max(metrics["bookings_prev"], 1)) * 100
     cards = [
@@ -321,26 +539,34 @@ def serve_layout(metrics, figs, start_date=None, end_date=None):
 
     card_divs = [
         html.Div([
-            html.Div(card["label"], style={"color": "#6c757d", "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "0.05em"}),
-            html.Div(card["value"], style={"fontSize": "24px", "fontWeight": "600"}),
-            html.Div(card["delta"], style={"color": "#198754", "fontSize": "12px"}),
-        ], className="card") for card in cards
+            html.Div(card["label"], className="kpi-label"),
+            html.Div(card["value"], className="kpi-value"),
+            html.Div(card["delta"], className="kpi-delta"),
+        ], className="card kpi-card") for card in cards
     ]
 
     return html.Div([
-        html.H2("Business Dashboard"),
-        html.Div(card_divs, className="cards"),
-        dcc.Graph(figure=figs[0]),
-        dcc.Graph(figure=figs[1]),
         html.Div([
-            html.Div(dcc.Graph(figure=figs[2]), className="half"),
-            html.Div(dcc.Graph(figure=figs[3]), className="half"),
+            html.Div([
+                html.Div("Overview", className="section-eyebrow"),
+                html.H2("Business Dashboard", className="section-title"),
+                html.Div("Performance snapshot across bookings, revenue, and staffing.", className="section-subtitle"),
+            ], className="section-head"),
+            html.Div(card_divs, className="cards"),
+        ], className="section-block"),
+        html.Div([
+            html.Div(dcc.Graph(figure=figs[0], className="graph-card"), className="panel-graph"),
+            html.Div(dcc.Graph(figure=figs[1], className="graph-card"), className="panel-graph"),
         ], className="row"),
         html.Div([
-            html.Div(dcc.Graph(figure=figs[4]), className="half"),
-            html.Div(dcc.Graph(figure=figs[5]), className="half"),
+            html.Div(dcc.Graph(figure=figs[2], className="graph-card"), className="panel-graph"),
+            html.Div(dcc.Graph(figure=figs[3], className="graph-card"), className="panel-graph"),
         ], className="row"),
-    ], style={"padding": "16px", "display": "flex", "flexDirection": "column", "gap": "16px"})
+        html.Div([
+            html.Div(dcc.Graph(figure=figs[4], className="graph-card"), className="panel-graph"),
+            html.Div(dcc.Graph(figure=figs[5], className="graph-card"), className="panel-graph"),
+        ], className="row"),
+    ], className="dashboard-stack")
 
 
 def build_app(metrics, figs):
@@ -362,13 +588,21 @@ def build_app(metrics, figs):
                 ),
             ], className="card"),
         ], className="cards"),
-        html.Div(id="dashboard-panel", children=serve_layout(metrics, figs))
-    ])
+        html.Div(id="dashboard-panel", children=serve_layout(metrics, figs), className="stack")
+    ], className="tab-content")
     qa_tab = html.Div([
-        html.H3("Conversational Analytics", className="section-title"),
-        html.Div("Ask a question about your business. We’ll translate to safe SQL and summarize.", className="subtitle"),
-        dcc.Textarea(id="qa-input", placeholder="e.g., How many bookings last week? Revenue by staff this month?", className="textarea"),
-        html.Button("Ask", id="qa-submit", n_clicks=0, className="primary-btn"),
+        html.Div([
+            html.H3("Conversational Analytics", className="section-title"),
+            html.Div("Ask a question about your business. We’ll translate to safe SQL and summarize.", className="subtitle"),
+        ], className="section-head"),
+        html.Div([
+            dcc.Textarea(
+                id="qa-input",
+                placeholder="e.g., How many bookings last week? Revenue by staff this month?",
+                className="textarea",
+            ),
+            html.Button("Ask", id="qa-submit", n_clicks=0, className="primary-btn"),
+        ], className="stack"),
         html.Div([
             html.Div("Answer", className="pill-label"),
             html.Div(id="qa-answer", className="answer-card")
@@ -377,15 +611,48 @@ def build_app(metrics, figs):
             html.Div("SQL", className="pill-label"),
             html.Pre(id="qa-sql", className="code-block")
         ], className="card shadow")
-    ], className="panel")
+    ], className="panel stack tab-content")
+
+    calendar_timeline, calendar_month, calendar_day = build_calendar_views(metrics)
+    calendar_payload = build_calendar_payload(metrics["appts"])
+    calendar_data = calendar_payload.to_dict(orient="records")
+    time_options = build_time_options()
+    calendar_tab = html.Div([
+        html.Div([
+            html.H3("Calendar", className="section-title"),
+            html.Div("View upcoming appointments in timeline or month format.", className="subtitle"),
+        ], className="section-head"),
+        dcc.Store(id="calendar-data", data=calendar_data),
+        dcc.Tabs([
+            dcc.Tab(label="Timeline", children=[dcc.Graph(figure=calendar_timeline, className="graph-card")], className="tab", selected_className="tab-selected"),
+            dcc.Tab(label="Month", children=[calendar_month], className="tab", selected_className="tab-selected"),
+            dcc.Tab(label="Day", children=[
+                html.Div([
+                    html.Div("Select day", className="pill-label"),
+                    dcc.DatePickerSingle(id="calendar-day", date=date.today(), display_format="YYYY-MM-DD"),
+                    dcc.Dropdown(id="calendar-time", options=time_options, value="", clearable=False, className="calendar-time"),
+                ], className="calendar-toolbar"),
+                html.Div(id="calendar-day-view", children=calendar_day),
+            ], className="tab", selected_className="tab-selected"),
+        ], className="subtabs"),
+        html.Div("Select an event to see details.", id="calendar-detail", className="calendar-detail")
+    ], className="panel stack tab-content")
 
     app.layout = html.Div([
         html.Div([
-            html.H1("Voice Facilitator Insights", className="hero-title"),
-            html.Div("Operational KPIs and conversational analytics in one place.", className="hero-subtitle")
+            html.Div([
+                html.Div("Voice Facilitator", className="eyebrow"),
+                html.H1("Operations Command Center", className="hero-title"),
+                html.Div("Sleek, fast visibility into scheduling, revenue, and customer momentum.", className="hero-subtitle"),
+            ], className="hero-copy"),
+            html.Div([
+                html.Div("Last synced", className="pill-label"),
+                html.Div(datetime.now().strftime("%b %d, %Y • %I:%M %p").lstrip("0"), className="hero-meta"),
+            ], className="hero-meta-wrap"),
         ], className="hero"),
         dcc.Tabs([
             dcc.Tab(label="Dashboard", children=[graph_tab], className="tab", selected_className="tab-selected"),
+            dcc.Tab(label="Calendar", children=[calendar_tab], className="tab", selected_className="tab-selected"),
             dcc.Tab(label="Conversational Analytics", children=[qa_tab], className="tab", selected_className="tab-selected"),
         ], className="tabs")
     ], className="page")
@@ -399,41 +666,351 @@ def build_app(metrics, figs):
             {%favicon%}
             {%css%}
             <style>
+                @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
                 :root {
-                    --bg: #f7f9fc;
-                    --panel: #ffffff;
-                    --card: #ffffff;
-                    --accent: #5c6cff;
-                    --accent2: #23c197;
-                    --text: #1f2430;
-                    --muted: #7b8295;
-                    --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-                    --border: #e8ecf5;
+                    --bg: #f4f2ef;
+                    --panel: rgba(255, 255, 255, 0.92);
+                    --card: rgba(255, 255, 255, 0.96);
+                    --accent: #0f6fff;
+                    --accent-strong: #0b1b3a;
+                    --accent2: #1bb98a;
+                    --text: #111827;
+                    --muted: #6b7280;
+                    --shadow: 0 20px 45px rgba(15, 23, 42, 0.12);
+                    --border: rgba(15, 23, 42, 0.08);
+                    --glow: 0 0 0 1px rgba(15, 23, 42, 0.04), 0 8px 22px rgba(15, 23, 42, 0.06);
+                    --space-1: 8px;
+                    --space-2: 14px;
+                    --space-3: 18px;
+                    --space-4: 24px;
                 }
                 * { box-sizing: border-box; }
-                body { background: radial-gradient(circle at 20% 20%, rgba(92,108,255,0.08), transparent 25%), radial-gradient(circle at 80% 0%, rgba(35,193,151,0.08), transparent 30%), var(--bg); font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif; color: var(--text); margin: 0; }
-                .page { padding: 20px; }
-                .hero { margin-bottom: 16px; }
-                .hero-title { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
-                .hero-subtitle { color: var(--muted); margin-top: 4px; }
-                .tabs .tab { background: transparent; }
-                .tabs .tab-selected { background: var(--panel); color: var(--text); border-bottom: 2px solid var(--accent); }
-                .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 16px; }
-                .card { background: var(--card); padding: 14px 16px; border-radius: 14px; box-shadow: var(--shadow); border: 1px solid var(--border); }
+                body {
+                    background:
+                        radial-gradient(circle at 15% 20%, rgba(15, 111, 255, 0.12), transparent 35%),
+                        radial-gradient(circle at 85% 10%, rgba(27, 185, 138, 0.10), transparent 40%),
+                        linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(244, 242, 239, 0.85)),
+                        var(--bg);
+                    font-family: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+                    color: var(--text);
+                    margin: 0;
+                }
+                .page { padding: 28px; max-width: 1200px; margin: 0 auto; }
+                .hero {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    gap: 24px;
+                    padding: 20px 24px;
+                    background: var(--panel);
+                    border-radius: 20px;
+                    box-shadow: var(--shadow);
+                    border: 1px solid var(--border);
+                    margin-bottom: 18px;
+                    backdrop-filter: blur(10px);
+                }
+                .hero-copy { display: flex; flex-direction: column; gap: 6px; }
+                .eyebrow {
+                    text-transform: uppercase;
+                    letter-spacing: 0.24em;
+                    font-size: 11px;
+                    color: var(--muted);
+                }
+                .hero-title {
+                    margin: 0;
+                    font-size: 30px;
+                    font-weight: 700;
+                    letter-spacing: -0.02em;
+                    font-family: 'Fraunces', 'Space Grotesk', serif;
+                }
+                .hero-subtitle { color: var(--muted); margin-top: 4px; max-width: 520px; }
+                .hero-meta-wrap { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+                .hero-meta { font-size: 14px; font-weight: 600; color: var(--accent-strong); }
+                .tabs { margin-top: var(--space-2); }
+                .tabs .tab { background: transparent; border: none; }
+                .tabs .tab-selected {
+                    background: var(--panel);
+                    color: var(--text);
+                    border-bottom: 2px solid var(--accent);
+                    box-shadow: var(--glow);
+                }
+                .tab-content { display: flex; flex-direction: column; gap: var(--space-3); }
+                .dashboard-stack { display: flex; flex-direction: column; gap: var(--space-3); }
+                .stack { display: flex; flex-direction: column; gap: var(--space-2); }
+                .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--space-2); margin-bottom: 0; }
+                .card {
+                    background: var(--card);
+                    padding: 16px 18px;
+                    border-radius: 16px;
+                    box-shadow: var(--shadow);
+                    border: 1px solid var(--border);
+                }
+                .kpi-card { position: relative; overflow: hidden; }
+                .kpi-card::after {
+                    content: "";
+                    position: absolute;
+                    right: -20px;
+                    top: -30px;
+                    width: 90px;
+                    height: 90px;
+                    background: radial-gradient(circle, rgba(15, 111, 255, 0.14), transparent 70%);
+                }
+                .kpi-label {
+                    color: var(--muted);
+                    font-size: 11px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.12em;
+                }
+                .kpi-value { font-size: 26px; font-weight: 700; margin-top: 6px; }
+                .kpi-delta { color: #149f76; font-size: 12px; margin-top: 4px; }
                 .shadow { box-shadow: var(--shadow); }
-                .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
-                .half { background: var(--card); padding: 8px; border-radius: 14px; box-shadow: var(--shadow); border: 1px solid var(--border); }
-                .dash-graph { background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
+                .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-2); }
+                .panel-graph {
+                    background: var(--card);
+                    border-radius: 16px;
+                    padding: 6px;
+                    box-shadow: var(--shadow);
+                    border: 1px solid var(--border);
+                }
+                .graph-card { width: 100%; height: 100%; }
                 .section-title { margin: 0; font-size: 22px; }
+                .section-eyebrow {
+                    text-transform: uppercase;
+                    font-size: 11px;
+                    letter-spacing: 0.12em;
+                    color: var(--muted);
+                }
+                .section-subtitle { color: var(--muted); margin-top: 6px; }
+                .section-head { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
+                .section-block { display: flex; flex-direction: column; gap: var(--space-2); }
                 .subtitle { color: var(--muted); margin: 6px 0 12px 0; }
-                .panel { padding: 16px; background: var(--panel); border-radius: 16px; box-shadow: var(--shadow); border: 1px solid var(--border); }
-                .textarea { width: 100%; min-height: 120px; border-radius: 12px; border: 1px solid var(--border); padding: 10px; background: #fdfefe; color: var(--text); }
-                .primary-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: white; border: none; padding: 10px 18px; border-radius: 10px; cursor: pointer; font-weight: 600; }
+                .panel {
+                    padding: var(--space-3);
+                    background: var(--panel);
+                    border-radius: 18px;
+                    box-shadow: var(--shadow);
+                    border: 1px solid var(--border);
+                }
+                .textarea {
+                    width: 100%;
+                    min-height: 120px;
+                    border-radius: 12px;
+                    border: 1px solid var(--border);
+                    padding: 12px;
+                    background: #fefefe;
+                    color: var(--text);
+                    font-size: 14px;
+                }
+                .primary-btn {
+                    background: linear-gradient(135deg, var(--accent), var(--accent2));
+                    color: white;
+                    border: none;
+                    padding: 10px 18px;
+                    border-radius: 12px;
+                    cursor: pointer;
+                    font-weight: 600;
+                    box-shadow: 0 12px 24px rgba(15, 111, 255, 0.18);
+                }
                 .primary-btn:hover { opacity: 0.95; }
-                .pill-label { display: inline-block; padding: 4px 10px; border-radius: 20px; background: #eef1fb; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+                .pill-label {
+                    display: inline-flex;
+                    align-items: center;
+                    padding: 4px 10px;
+                    border-radius: 999px;
+                    background: rgba(15, 111, 255, 0.08);
+                    color: var(--muted);
+                    font-size: 11px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.12em;
+                }
                 .answer-card { margin-top: 6px; color: var(--text); }
-                .code-block { background: #f4f6fb; color: #30394f; padding: 10px; border-radius: 10px; white-space: pre-wrap; border: 1px solid var(--border); }
+                .code-block {
+                    background: #f3f5fb;
+                    color: #30394f;
+                    padding: 12px;
+                    border-radius: 12px;
+                    white-space: pre-wrap;
+                    border: 1px solid var(--border);
+                }
+                .subtabs { margin-top: var(--space-2); }
+                .subtabs .tab { background: transparent; }
+                .subtabs .tab-selected {
+                    background: var(--panel);
+                    color: var(--text);
+                    border-bottom: 2px solid var(--accent2);
+                    box-shadow: var(--glow);
+                }
+                .calendar-wrap { display: flex; flex-direction: column; gap: var(--space-1); }
+                .calendar-title { font-weight: 600; }
+                .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--border); border-top: none; }
+                .cal-head-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+                .cal-head { text-align: left; font-size: 12px; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); }
+                .cal-cell {
+                    border-top: 1px solid var(--border);
+                    border-right: 1px solid var(--border);
+                    padding: 8px 10px;
+                    min-height: 110px;
+                    background: #ffffff;
+                }
+                .cal-cell:nth-child(7n) { border-right: none; }
+                .cal-empty { background: #f1f3f7; }
+                .cal-day { font-weight: 600; font-size: 12px; color: var(--text); margin-bottom: 6px; }
+                .cal-events { display: flex; flex-direction: column; gap: 4px; }
+                .cal-chip-btn {
+                    background: rgba(15, 111, 255, 0.12);
+                    color: #1f2a4b;
+                    padding: 4px 6px;
+                    border-radius: 8px;
+                    font-size: 11px;
+                    text-align: left;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    border: none;
+                    cursor: pointer;
+                }
+                .cal-chip-btn:hover { background: rgba(15, 111, 255, 0.2); }
+                .cal-more { font-size: 11px; color: var(--muted); }
+                .calendar-empty { color: var(--muted); }
+                .calendar-toolbar { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
+                .calendar-time { min-width: 180px; }
+                .day-list { display: flex; flex-direction: column; gap: var(--space-2); }
+                .day-item-btn {
+                    display: grid;
+                    grid-template-columns: 90px 1fr;
+                    gap: 12px;
+                    padding: 10px 12px;
+                    border-radius: 12px;
+                    border: 1px solid var(--border);
+                    background: #ffffff;
+                    text-align: left;
+                    cursor: pointer;
+                }
+                .day-item-btn:hover { border-color: rgba(15, 111, 255, 0.4); background: rgba(15, 111, 255, 0.04); }
+                .day-time { font-weight: 600; color: var(--text); }
+                .day-details { display: flex; flex-direction: column; gap: 2px; }
+                .day-title { font-weight: 600; }
+                .day-subtitle { font-size: 12px; color: var(--muted); }
+                .calendar-detail {
+                    margin-top: var(--space-2);
+                    padding: 12px;
+                    border-radius: 12px;
+                    border: 1px solid var(--border);
+                    background: #ffffff;
+                }
                 h2, h3 { color: var(--text); }
+
+                /* Date picker theming */
+                .DateRangePickerInput {
+                    background: #ffffff;
+                    border: 1px solid var(--border);
+                    border-radius: 12px;
+                    box-shadow: var(--glow);
+                    padding: 4px 6px;
+                }
+                .DateInput {
+                    background: transparent;
+                }
+                .DateInput_input {
+                    font-family: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+                    font-size: 13px;
+                    color: var(--text);
+                    background: transparent;
+                    border: none;
+                    padding: 6px 8px;
+                }
+                .DateRangePickerInput_arrow {
+                    color: var(--muted);
+                }
+                .DateInput_input__focused {
+                    border: none;
+                    outline: none;
+                    background: rgba(15, 111, 255, 0.08);
+                    border-radius: 8px;
+                }
+                .CalendarDay__default {
+                    border: 1px solid transparent;
+                    color: var(--text);
+                }
+                .CalendarDay__default:hover {
+                    background: rgba(15, 111, 255, 0.08);
+                    border: 1px solid rgba(15, 111, 255, 0.2);
+                }
+                .CalendarDay__selected, .CalendarDay__selected:active, .CalendarDay__selected:hover {
+                    background: var(--accent);
+                    border: 1px solid var(--accent);
+                    color: #ffffff;
+                }
+                .CalendarDay__selected_span, .CalendarDay__selected_span:hover {
+                    background: rgba(15, 111, 255, 0.18);
+                    border: 1px solid rgba(15, 111, 255, 0.18);
+                    color: var(--text);
+                }
+                .CalendarDay__hovered_span, .CalendarDay__hovered_span:hover {
+                    background: rgba(15, 111, 255, 0.12);
+                    border: 1px solid rgba(15, 111, 255, 0.12);
+                    color: var(--text);
+                }
+                .DayPickerKeyboardShortcuts_show__bottomRight {
+                    border-right: 33px solid rgba(15, 111, 255, 0.3);
+                }
+
+                /* DatePickerSingle aligns with DateRangePicker */
+                .SingleDatePickerInput {
+                    background: #ffffff;
+                    border: 1px solid var(--border);
+                    border-radius: 12px;
+                    box-shadow: var(--glow);
+                    padding: 4px 6px;
+                }
+                .SingleDatePickerInput__withBorder { border: 1px solid var(--border); }
+
+                /* Dropdown theming (react-select) */
+                .Select-control {
+                    background: #ffffff;
+                    border: 1px solid var(--border);
+                    border-radius: 12px;
+                    box-shadow: var(--glow);
+                    min-height: 36px;
+                }
+                .Select-placeholder,
+                .Select--single > .Select-control .Select-value {
+                    color: var(--text);
+                    line-height: 36px;
+                }
+                .Select-input > input {
+                    color: var(--text);
+                    font-family: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+                }
+                .Select-menu-outer {
+                    border: 1px solid var(--border);
+                    border-radius: 12px;
+                    box-shadow: var(--shadow);
+                }
+                .Select-option {
+                    background: #ffffff;
+                    color: var(--text);
+                }
+                .Select-option.is-focused {
+                    background: rgba(15, 111, 255, 0.08);
+                    color: var(--text);
+                }
+                .Select-option.is-selected {
+                    background: rgba(15, 111, 255, 0.18);
+                    color: var(--text);
+                }
+                .Select-arrow { border-color: var(--muted) transparent transparent; }
+                .is-open > .Select-control .Select-arrow { border-color: transparent transparent var(--muted); }
+
+                @media (max-width: 900px) {
+                    .hero { flex-direction: column; align-items: flex-start; }
+                    .hero-meta-wrap { align-items: flex-start; }
+                }
+                @media (max-width: 600px) {
+                    .page { padding: 18px; }
+                    .cards { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+                    .row { grid-template-columns: 1fr; }
+                }
             </style>
         </head>
         <body>
@@ -477,6 +1054,60 @@ def main():
             return serve_layout(metrics_f, figs_f)
         except Exception as e:
             return html.Div(f"Error loading data: {e}")
+
+    # Callback: calendar day view refresh
+    @app.callback(
+        Output("calendar-day-view", "children"),
+        [Input("calendar-day", "date"), Input("calendar-time", "value"), Input("calendar-data", "data")]
+    )
+    def update_calendar_day(selected_date, selected_time, data):
+        if not data:
+            return html.Div("No appointments available.", className="calendar-empty")
+        appts_df = pd.DataFrame(data)
+        return build_day_view(appts_df, selected_date, selected_time)
+
+    @app.callback(
+        Output("calendar-detail", "children"),
+        [Input({"type": "cal-event", "index": ALL}, "n_clicks")],
+        [State("calendar-data", "data")]
+    )
+    def update_calendar_detail(n_clicks, data):
+        if not data:
+            return "Select an event to see details."
+        ctx = callback_context
+        if not ctx.triggered:
+            return "Select an event to see details."
+        trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+        if not trigger:
+            return "Select an event to see details."
+        try:
+            event_id = json.loads(trigger)["index"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return "Select an event to see details."
+        match = next((row for row in data if row.get("event_id") == event_id), None)
+        if not match:
+            return "Select an event to see details."
+        service_name = match.get("service_name") or "Service"
+        if service_name == "Unknown":
+            service_name = "Service"
+        staff_name = match.get("staff_name") or "Unassigned"
+        date_label = match.get("appointment_date")
+        time_label = match.get("appointment_time")
+        if date_label and pd.notna(date_label):
+            date_label = pd.to_datetime(date_label, errors="coerce").strftime("%b %d, %Y")
+        else:
+            date_label = "TBD"
+        if time_label and pd.notna(time_label):
+            time_label = pd.to_datetime(time_label, errors="coerce").strftime("%I:%M %p").lstrip("0")
+        else:
+            time_label = "TBD"
+        return html.Div([
+            html.Div(service_name, className="day-title"),
+            html.Div(f"{date_label} • {time_label}", className="day-subtitle"),
+            html.Div(f"Staff: {staff_name}", className="day-subtitle"),
+            html.Div(f"Status: {match.get('status', 'scheduled')}", className="day-subtitle"),
+            html.Div(f"Duration: {match.get('duration_minutes', '30')} min", className="day-subtitle"),
+        ])
 
     # Callback for conversational analytics
     @app.callback(

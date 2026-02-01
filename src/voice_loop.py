@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import re
 from typing import Optional
 from src.stt import SpeechToText
 from src.tts import TextToSpeech
@@ -79,7 +80,7 @@ class VoiceLoop:
         # Greeting
         greeting = self.agent.get_greeting()
         print(f"Assistant: {greeting}")
-        self.tts.speak(greeting)
+        self.tts.speak(self._humanize_times_in_text(greeting))
         self._log_turn("assistant", greeting)
         
         # Main loop
@@ -336,7 +337,7 @@ class VoiceLoop:
                 
                 # Speak
                 logger.info("Speaking response...")
-                self.tts.speak(response_text)
+                self.tts.speak(self._humanize_times_in_text(response_text))
                 
                 # Check if conversation is complete
                 conversation_complete = agent_decision.get('conversation_complete', False)
@@ -362,7 +363,7 @@ class VoiceLoop:
         # Closing
         closing = "Thank you for calling. Have a great day!"
         print(f"\nAssistant: {closing}")
-        self.tts.speak(closing)
+        self.tts.speak(self._humanize_times_in_text(closing))
         self._log_turn("assistant", closing)
         
         # Cleanup
@@ -382,6 +383,48 @@ class VoiceLoop:
         if text is None:
             return
         self.call_transcript.append({"role": role, "text": text})
+        self._persist_call_progress()
+
+    def _format_time_for_speech(self, value: str) -> str:
+        """Convert HH:MM (24h) to h:MM AM/PM for speech."""
+        raw = value.strip()
+        if ":" not in raw:
+            return raw
+        parts = raw.split(":")
+        if len(parts) < 2:
+            return raw
+        hour_part = parts[0]
+        minute_part = parts[1]
+        if not hour_part.isdigit() or not minute_part[:2].isdigit():
+            return raw
+        hour = int(hour_part)
+        minute = int(minute_part[:2])
+        if hour > 23 or minute > 59:
+            return raw
+        suffix = "AM" if hour < 12 else "PM"
+        hour_12 = hour % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        return f"{hour_12}:{minute:02d} {suffix}"
+
+    def _humanize_times_in_text(self, text: str) -> str:
+        """Replace 24h times in text with 12h format for TTS."""
+        if not text:
+            return text
+        # Skip time humanization for non-English output to avoid corrupting localized times
+        if re.search(r"[^\x00-\x7F]", text):
+            return text
+
+        def _repl(match: re.Match) -> str:
+            value = match.group(0)
+            start = match.start()
+            end = match.end()
+            tail = text[end:end + 6].lower()
+            if re.match(r"\s*(am|pm)\b", tail):
+                return value
+            return self._format_time_for_speech(value)
+
+        return re.sub(r"\b([01]?\d|2[0-3]):[0-5]\d\b", _repl, text)
 
     def _finalize_call(self, conversation_complete: bool):
         """Persist call transcript and outcome."""
@@ -390,7 +433,7 @@ class VoiceLoop:
         outcome = self.call_outcome or ("completed" if conversation_complete else "inquiry")
         try:
             import json
-            transcript_str = json.dumps(self.call_transcript)
+            transcript_str = json.dumps(self.call_transcript, ensure_ascii=False)
             self.database.finalize_call(
                 self.call_id,
                 outcome=outcome,
@@ -401,6 +444,17 @@ class VoiceLoop:
             logger.info(f"Call {self.call_id} finalized with outcome {outcome}")
         except Exception as e:
             logger.warning(f"Failed to finalize call {self.call_id}: {e}")
+
+    def _persist_call_progress(self):
+        """Persist transcript during the call for durability."""
+        if not self.call_id:
+            return
+        try:
+            import json
+            transcript_str = json.dumps(self.call_transcript, ensure_ascii=False)
+            self.database.update_call_transcript(self.call_id, transcript_str)
+        except Exception as e:
+            logger.debug(f"Failed to persist transcript: {e}")
 
 
 def main():

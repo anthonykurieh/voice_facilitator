@@ -26,6 +26,66 @@ class BackendTools:
         # Cache config services/staff for fallback
         self._config_services = {s.get("name", "").lower(): s for s in self.config.get_services()}
         self._config_staff = [s for s in self.config.get_staff() if s.get("available", True)]
+
+    def _normalize_phone(self, raw_phone: Optional[str]) -> Optional[str]:
+        """Normalize phone input into 10-digit string when possible."""
+        if not raw_phone:
+            return None
+        text = str(raw_phone).lower()
+        # Map spoken digits to numbers (basic, flexible)
+        word_map = {
+            "zero": "0", "oh": "0",
+            "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9",
+        }
+        tokens = re.findall(r"[a-z]+|\d+", text)
+        digits: list[str] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token.isdigit():
+                digits.extend(list(token))
+            elif token in ("double", "triple") and i + 1 < len(tokens):
+                next_token = tokens[i + 1]
+                if next_token.isdigit():
+                    digits.extend(list(next_token) * (2 if token == "double" else 3))
+                elif next_token in word_map:
+                    digits.extend([word_map[next_token]] * (2 if token == "double" else 3))
+                i += 1
+            elif token in word_map:
+                digits.append(word_map[token])
+            i += 1
+
+        if not digits:
+            digits = list(re.sub(r"\D", "", text))
+
+        if not digits:
+            return None
+
+        num = "".join(digits)
+        if len(num) == 11 and num.startswith("1"):
+            num = num[1:]
+        if len(num) < 10:
+            return None
+        if len(num) > 10:
+            num = num[-10:]
+        return num
+
+    def _normalize_name(self, raw_name: Optional[str]) -> Optional[str]:
+        """Normalize customer name input."""
+        if not raw_name:
+            return None
+        import unicodedata
+        name = str(raw_name)
+        # Drop control characters that can leak from bad encodings
+        name = "".join(ch for ch in name if not unicodedata.category(ch).startswith("C"))
+        name = " ".join(name.strip().split())
+        if not name:
+            return None
+        has_letter = any(unicodedata.category(ch).startswith("L") for ch in name)
+        if not has_letter:
+            return None
+        return name
     
     def execute(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Execute an action.
@@ -360,11 +420,33 @@ class BackendTools:
                 "message": f"Sorry, we're closed on {day_name}s."
             }
         
-        slots = self.db.get_available_slots(
-            appointment_date, 
-            staff_id=staff_id,
-            duration_minutes=duration_minutes
-        )
+        slots = []
+        if staff_id:
+            slots = self.db.get_available_slots(
+                appointment_date,
+                staff_id=staff_id,
+                duration_minutes=duration_minutes
+            )
+        else:
+            # Union availability across all available staff
+            staff_list = self.db.get_available_staff()
+            if staff_list:
+                slot_times = set()
+                for staff in staff_list:
+                    staff_slots = self.db.get_available_slots(
+                        appointment_date,
+                        staff_id=staff.get("id"),
+                        duration_minutes=duration_minutes
+                    )
+                    for slot in staff_slots:
+                        slot_times.add(slot["time"])
+                slots = [{"time": t} for t in sorted(slot_times)]
+            else:
+                slots = self.db.get_available_slots(
+                    appointment_date,
+                    staff_id=None,
+                    duration_minutes=duration_minutes
+                )
         
         return {
             "date": appointment_date.isoformat(),
@@ -382,13 +464,17 @@ class BackendTools:
         time_str = params.get('time')
         service_info = self._resolve_service(params)
         service_name = service_info.get("service_name")
-        staff_info = self._resolve_staff(params)
-        if staff_info.get("error"):
-            return {"error": staff_info.get("error")}
-        staff_name = staff_info.get("staff_name")
-        staff_id = staff_info.get("staff_id")
-        customer_phone = params.get('customer_phone')
-        customer_name = params.get('customer_name')
+        staff_specified = bool(params.get("staff_id") or params.get("staff"))
+        staff_name = None
+        staff_id = None
+        if staff_specified:
+            staff_info = self._resolve_staff(params)
+            if staff_info.get("error"):
+                return {"error": staff_info.get("error")}
+            staff_name = staff_info.get("staff_name")
+            staff_id = staff_info.get("staff_id")
+        customer_phone = self._normalize_phone(params.get('customer_phone'))
+        customer_name = self._normalize_name(params.get('customer_name'))
         
         # Always require customer identity for booking
         missing_fields = []
@@ -400,7 +486,7 @@ class BackendTools:
             return {
                 "error": "Missing required customer information.",
                 "missing_fields": missing_fields,
-                "message": "Please provide the customer's name and phone number to book."
+                "message": "Please provide the customer's name and 10-digit phone number to book."
             }
         
         appointment_date = self._parse_date(date_str) if date_str else None
@@ -451,20 +537,61 @@ class BackendTools:
         service_id = service_info.get("service_id")
         duration_minutes = service_info.get("duration") or params.get('duration_minutes') or 30
         service_price = service_info.get("price")
-        if staff_id is None and staff_name:
-            db_staff = self.db.get_staff_by_name(staff_name)
-            if db_staff:
-                staff_id = db_staff['id']
-        
-        # CRITICAL: Check if the time slot is still available before booking
-        available_slots = self.db.get_available_slots(
-            appointment_date,
-            staff_id=staff_id,
-            duration_minutes=duration_minutes
-        )
+        requested_time_str = appointment_time.strftime("%H:%M")
+        available_slots = []
+
+        if staff_specified:
+            if staff_id is None and staff_name:
+                db_staff = self.db.get_staff_by_name(staff_name)
+                if db_staff:
+                    staff_id = db_staff['id']
+            available_slots = self.db.get_available_slots(
+                appointment_date,
+                staff_id=staff_id,
+                duration_minutes=duration_minutes
+            )
+        else:
+            # Auto-assign an available staff member for the requested time
+            staff_list = self.db.get_available_staff()
+            selected_staff = None
+            for staff in staff_list:
+                staff_slots = self.db.get_available_slots(
+                    appointment_date,
+                    staff_id=staff.get("id"),
+                    duration_minutes=duration_minutes
+                )
+                for slot in staff_slots:
+                    if slot["time"].strftime("%H:%M") == requested_time_str:
+                        selected_staff = staff
+                        available_slots = staff_slots
+                        break
+                if selected_staff:
+                    break
+            if selected_staff:
+                staff_id = selected_staff.get("id")
+                staff_name = selected_staff.get("name")
+            else:
+                # Build union list for suggestions
+                slot_times = set()
+                for staff in staff_list:
+                    staff_slots = self.db.get_available_slots(
+                        appointment_date,
+                        staff_id=staff.get("id"),
+                        duration_minutes=duration_minutes
+                    )
+                    for slot in staff_slots:
+                        slot_times.add(slot["time"].strftime("%H:%M"))
+                available_times = sorted(slot_times)[:10]
+                return {
+                    "error": f"The requested time slot ({requested_time_str}) is no longer available.",
+                    "date": appointment_date.isoformat(),
+                    "requested_time": requested_time_str,
+                    "available_slots": available_times,
+                    "count": len(slot_times),
+                    "suggestion": f"Available times include: {', '.join(available_times) if available_times else 'None'}"
+                }
         
         # Check if the requested time is in the available slots
-        requested_time_str = appointment_time.strftime("%H:%M")
         slot_available = False
         for slot in available_slots:
             slot_time_str = slot['time'].strftime("%H:%M")
@@ -537,26 +664,35 @@ class BackendTools:
     def cancel_appointment(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Cancel an appointment."""
         appointment_id = params.get('appointment_id')
-        customer_phone = params.get('customer_phone')
+        customer_phone = self._normalize_phone(params.get('customer_phone'))
         
         if appointment_id:
             success = self.db.cancel_appointment(appointment_id)
-            return {"success": success}
+            apt = self.db.get_appointment_by_id(appointment_id)
+            status = apt.get("status") if apt else None
+            if success and status == "cancelled":
+                return {"success": True, "status": status, "appointment_id": appointment_id}
+            return {"error": "Cancellation failed to update status.", "status": status, "appointment_id": appointment_id}
         elif customer_phone:
             # Get customer's appointments and cancel the next one
             customer = self.db.get_customer_by_phone(customer_phone)
             if customer:
                 appointments = self.db.get_customer_appointments(customer['id'], upcoming_only=True)
                 if appointments:
-                    success = self.db.cancel_appointment(appointments[0]['id'])
-                    return {"success": success}
+                    target_id = appointments[0]['id']
+                    success = self.db.cancel_appointment(target_id)
+                    apt = self.db.get_appointment_by_id(target_id)
+                    status = apt.get("status") if apt else None
+                    if success and status == "cancelled":
+                        return {"success": True, "status": status, "appointment_id": target_id}
+                    return {"error": "Cancellation failed to update status.", "status": status, "appointment_id": target_id}
             return {"error": "No upcoming appointments found"}
         else:
             return {"error": "appointment_id or customer_phone required"}
     
     def get_customer_appointments(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get customer's appointments."""
-        customer_phone = params.get('customer_phone')
+        customer_phone = self._normalize_phone(params.get('customer_phone'))
         
         if not customer_phone:
             return {"error": "customer_phone required"}
@@ -617,7 +753,7 @@ class BackendTools:
         so the agent can ask the customer for a new slot.
         """
         appointment_id = params.get('appointment_id')
-        customer_phone = params.get('customer_phone')
+        customer_phone = self._normalize_phone(params.get('customer_phone'))
         new_date_str = params.get('new_date')
         new_time_str = params.get('new_time')
         

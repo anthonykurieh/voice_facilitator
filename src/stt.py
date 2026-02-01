@@ -10,7 +10,7 @@ import time
 from src.config import (
     SAMPLE_RATE, CHANNELS, RECORD_MAX_SECONDS, FRAME_DURATION_SEC,
     SILENCE_DURATION_SEC, ENERGY_FLOOR, ENERGY_CEIL, STOP_THRESHOLD_RATIO,
-    STT_MODEL
+    STT_MODEL, STT_LANGUAGE
 )
 
 
@@ -179,7 +179,8 @@ class SpeechToText:
                         break
         
         except KeyboardInterrupt:
-            pass
+            self.is_listening = False
+            raise
         except sd.CallbackStop:
             pass
         
@@ -212,11 +213,13 @@ class SpeechToText:
                 
                 # Transcribe
                 with open(tmp_file.name, 'rb') as audio_file:
-                    transcript = self.client.audio.transcriptions.create(
-                        model=self.model,
-                        file=audio_file,
-                        language="en"
-                    )
+                    request = {
+                        "model": self.model,
+                        "file": audio_file,
+                    }
+                    if STT_LANGUAGE:
+                        request["language"] = STT_LANGUAGE
+                    transcript = self.client.audio.transcriptions.create(**request)
                 
                 text = transcript.text.strip()
                 os.unlink(tmp_file.name)

@@ -22,7 +22,8 @@ class AnalyticsAgent:
     def generate_sql(self, question: str) -> Dict[str, Any]:
         """Generate SELECT SQL for the given question.
 
-        Returns a dict with keys: sql, reasoning. Errors return an error field.
+        Returns a dict with keys: sql, reasoning, needs_clarification, clarification_question.
+        Errors return an error field.
         """
         system_prompt = f"""
 You convert business questions to safe, read-only SQL.
@@ -30,7 +31,9 @@ Rules:
 - SELECT only. Absolutely no INSERT/UPDATE/DELETE/ALTER/DROP/TRUNCATE/CREATE.
 - Use only these tables/columns:\n{self.schema}
 - Limit row outputs with LIMIT 200 when listing.
-- Return JSON: {{"sql": "...", "reasoning": "..."}}
+- If the question is ambiguous (missing time window, metric, or target), ask ONE concise follow-up question instead of guessing.
+- Return JSON: {{"sql": "...", "reasoning": "...", "needs_clarification": false, "clarification_question": ""}}
+- If clarification is needed, set needs_clarification=true, provide clarification_question, and leave sql empty.
 - If unsure, default to counting (COUNT(*)) rather than returning raw rows.
 """
         messages = [
@@ -45,6 +48,12 @@ Rules:
                 response_format={"type": "json_object"}
             )
             payload = json.loads(resp.choices[0].message.content)
+            if payload.get("needs_clarification"):
+                return {
+                    "needs_clarification": True,
+                    "clarification_question": payload.get("clarification_question", ""),
+                    "sql": ""
+                }
             sql = payload.get("sql", "")
             if not sql.lower().strip().startswith("select"):
                 return {"error": "Generated SQL is not SELECT", "sql": sql}
@@ -70,7 +79,7 @@ Rules:
                     safe[k] = v
             safe_rows.append(safe)
         system_prompt = """
-You summarize analytics query results concisely for an admin. Respond in plain text, number-first if applicable. Mention totals/percentages briefly. Avoid PII; if data was redacted, don't guess it.
+You summarize analytics query results concisely for an admin. Respond in plain text without leading numbering. Mention totals/percentages briefly. Avoid PII; if data was redacted, don't guess it.
 """
         user_content = json.dumps({"question": question, "rows": safe_rows, "meta": meta})
         messages = [

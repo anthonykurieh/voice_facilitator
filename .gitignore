@@ -16,3 +16,6 @@ ENV/
 *.mp3
 config/business_config.yaml
 
+client_secret.json
+.gcal_token.json
+.gcal_event_map.json

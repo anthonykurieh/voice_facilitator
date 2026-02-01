@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sys
+import logging
+from datetime import datetime
 from typing import List, Dict, Any
 
 import pandas as pd
@@ -19,6 +21,11 @@ from src.analytics_agent import AnalyticsAgent
 from src.tts import TextToSpeech
 from src.stt import SpeechToText
 from src.config import OPENAI_API_KEY
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+SQL_LOG_PATH = os.path.join(os.path.dirname(__file__), "analytics_sql.log")
 
 
 def get_engine() -> Engine:
@@ -45,21 +52,43 @@ def safe_execute(engine: Engine, sql: str) -> List[Dict[str, Any]]:
         return df.to_dict(orient="records")
 
 
+def _log_sql(question: str, sql: str, status: str):
+    try:
+        line = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "status": status,
+            "question": question,
+            "sql": sql,
+        }
+        with open(SQL_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to log SQL: {e}")
+
+
 def answer_question(agent: AnalyticsAgent, engine: Engine, question: str, speak: bool = False,
-                    tts: TextToSpeech = None) -> str:
+                    tts: TextToSpeech = None) -> Dict[str, Any]:
     plan = agent.generate_sql(question)
+    if plan.get("needs_clarification"):
+        return {
+            "needs_clarification": True,
+            "clarification_question": plan.get("clarification_question", "Can you clarify?"),
+        }
     if plan.get("error"):
-        return f"SQL generation error: {plan['error']}"
+        _log_sql(question, plan.get("sql", ""), "generation_error")
+        return {"error": f"SQL generation error: {plan['error']}"}
     sql = plan.get("sql", "")
+    _log_sql(question, sql, "generated")
     try:
         rows = safe_execute(engine, sql)
     except Exception as e:
-        return f"SQL execution error: {e}"
+        _log_sql(question, sql, "execution_error")
+        return {"error": f"SQL execution error: {e}"}
     meta = {"row_count": len(rows)}
     summary = agent.summarize(question, rows, meta)
     if speak and tts:
         tts.speak(summary)
-    return summary
+    return {"summary": summary, "sql": sql}
 
 
 def interactive_loop(use_voice: bool = False):
@@ -81,8 +110,31 @@ def interactive_loop(use_voice: bool = False):
                 question = input("You: ").strip()
                 if not question:
                     continue
-            summary = answer_question(agent, engine, question, speak=use_voice, tts=tts)
-            print(f"Answer: {summary}\n")
+            current_question = question
+            for _ in range(2):
+                result = answer_question(agent, engine, current_question, speak=use_voice, tts=tts)
+                if result.get("needs_clarification"):
+                    follow_up = result.get("clarification_question", "Can you clarify?")
+                    print(f"Assistant: {follow_up}")
+                    if use_voice:
+                        tts.speak(follow_up)
+                        clar = stt.listen()
+                        if not clar.strip():
+                            print("(No speech detected)")
+                            continue
+                        print(f"You (voice): {clar}")
+                    else:
+                        clar = input("You: ").strip()
+                        if not clar:
+                            continue
+                    current_question = f"{current_question} {clar}"
+                    continue
+                if result.get("error"):
+                    print(f"Answer: {result['error']}\n")
+                else:
+                    print(f"Answer: {result['summary']}\n")
+                    print(f"SQL: {result['sql']}\n")
+                break
         except KeyboardInterrupt:
             print("\nGoodbye")
             break

@@ -30,4 +30,7 @@ STOP_THRESHOLD_RATIO = float(os.getenv("STOP_THRESHOLD_RATIO", "0.70"))  # stop 
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 DIALOG_MODEL = os.getenv("DIALOG_MODEL", "gpt-4o")
+TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", DIALOG_MODEL)
 
+# Optional STT language hint (leave blank for auto-detect)
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "").strip()

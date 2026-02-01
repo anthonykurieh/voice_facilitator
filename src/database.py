@@ -215,6 +215,17 @@ class Database:
                 WHERE id = %s
             """, (outcome, transcript, customer_id, appointment_id, call_id))
             conn.commit()
+
+    def update_call_transcript(self, call_id: int, transcript: str) -> None:
+        """Persist transcript during a call to avoid losing turns."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE calls
+                SET transcript = %s
+                WHERE id = %s
+            """, (transcript, call_id))
+            conn.commit()
     
     def get_available_slots(self, date: date, staff_id: Optional[int] = None, 
                            duration_minutes: int = 30) -> List[Dict[str, Any]]:
