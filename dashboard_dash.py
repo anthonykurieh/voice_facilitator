@@ -150,6 +150,7 @@ def load_data(engine: Engine, start: Optional[date] = None, end: Optional[date] 
 def compute_metrics(appts, calls, hours, kpis):
     appts = appts.copy()  # avoid chained assignment warnings
     kpis = kpis.copy()
+    calls = calls.copy()
     today = date.today()
     last_7 = today - timedelta(days=6)
     prev_7_start = last_7 - timedelta(days=7)
@@ -175,8 +176,18 @@ def compute_metrics(appts, calls, hours, kpis):
 
     conversion = None
     if not calls.empty:
+        calls["started_at"] = pd.to_datetime(calls.get("started_at"), errors="coerce")
         calls_booked = calls[calls["outcome"] == "booked"].shape[0]
         conversion = (calls_booked / max(len(calls), 1)) * 100
+
+    # Simple call funnel metrics (last 7 days)
+    total_calls_7 = 0
+    booked_calls_pct_7 = 0
+    if not calls.empty and "started_at" in calls.columns:
+        calls_7 = calls[calls["started_at"].dt.date >= last_7]
+        total_calls_7 = int(calls_7.shape[0])
+        booked_calls_7 = int(calls_7[calls_7["outcome"] == "booked"].shape[0])
+        booked_calls_pct_7 = (booked_calls_7 / max(total_calls_7, 1)) * 100
 
     appts["service_price"] = pd.to_numeric(appts["service_price"], errors="coerce").fillna(0)
     appts["service_name"] = appts["service_name"].fillna("Unknown")
@@ -184,14 +195,18 @@ def compute_metrics(appts, calls, hours, kpis):
 
     # Revenue from kpi_events (booked) to avoid null service_ids
     revenue_30 = 0
+    avg_booking_value_30 = 0
     if not kpis.empty:
         kpi_booked = kpis[kpis["event_type"] == "booked"].copy()
         kpi_booked["service_price"] = pd.to_numeric(kpi_booked["service_price"], errors="coerce").fillna(0)
-        revenue_30 = kpi_booked[
+        booked_30 = kpi_booked[
             kpi_booked["created_at"].dt.date >= today - timedelta(days=29)
-        ]["service_price"].sum()
+        ]
+        revenue_30 = booked_30["service_price"].sum()
+        avg_booking_value_30 = revenue_30 / max(booked_30.shape[0], 1)
 
     total_recent = appts[appts["appointment_date"].dt.date >= today - timedelta(days=29)]
+    total_appointments_30 = int(total_recent.shape[0])
     no_show_rate = (
         total_recent[total_recent["status"] == "no_show"].shape[0]
         / max(total_recent.shape[0], 1)
@@ -281,7 +296,11 @@ def compute_metrics(appts, calls, hours, kpis):
         "bookings_7": bookings_7,
         "bookings_prev": bookings_prev,
         "conversion": conversion,
+        "total_calls_7": total_calls_7,
+        "booked_calls_pct_7": booked_calls_pct_7,
         "revenue_30": revenue_30,
+        "avg_booking_value_30": avg_booking_value_30,
+        "total_appointments_30": total_appointments_30,
         "no_show_rate": no_show_rate,
         "cancel_rate": cancel_rate,
         "utilization_avg": utilization_avg,
@@ -532,9 +551,13 @@ def serve_layout(metrics, figs, start_date=None, end_date=None):
     bookings_delta = ((metrics["bookings_7"] - metrics["bookings_prev"]) / max(metrics["bookings_prev"], 1)) * 100
     cards = [
         {"label": "Bookings (7d)", "value": metrics["bookings_7"], "delta": f"{bookings_delta:.1f}% vs prev 7d"},
+        {"label": "Total Calls (7d)", "value": metrics["total_calls_7"], "delta": ""},
+        {"label": "Booked Calls % (7d)", "value": f"{metrics['booked_calls_pct_7']:.1f}%", "delta": ""},
+        {"label": "Cancellation Rate (30d)", "value": f"{metrics['cancel_rate']:.1f}%", "delta": ""},
+        {"label": "Average Booking Value (30d)", "value": f"${metrics['avg_booking_value_30']:.0f}", "delta": ""},
+        {"label": "Total Appointments (30d)", "value": metrics["total_appointments_30"], "delta": ""},
         {"label": "Conversion", "value": f"{metrics['conversion']:.1f}%" if metrics["conversion"] is not None else "-", "delta": ""},
         {"label": "Revenue (30d)", "value": f"${metrics['revenue_30']:.0f}", "delta": ""},
-        {"label": "No-show rate (30d)", "value": f"{metrics['no_show_rate']:.1f}%", "delta": ""},
     ]
 
     card_divs = [

@@ -38,63 +38,135 @@ def init_business_data():
     print("Creating database schema...")
     db.initialize_schema()
     
-    # Insert business data
+    # Insert or sync business data
     with db.get_connection() as conn:
         cursor = conn.cursor()
-        
-        # Check if business already exists
-        cursor.execute("SELECT id FROM businesses WHERE id = 1")
-        if cursor.fetchone():
-            print("Business data already exists. Skipping initialization.")
-            return
-        
-        # Insert business
+
+        # Upsert business
         business_name = config.get_business_name()
         business_type = config.get_business_type()
         business_phone = config.get('business.phone')
+        business_timezone = config.get('business.timezone')
+        business_address = config.get('business.address')
+        business_website = config.get('business.website')
+
+        cursor.execute("SELECT id FROM businesses WHERE id = 1")
+        if cursor.fetchone():
+            cursor.execute("""
+                UPDATE businesses
+                SET name = %s,
+                    type = %s,
+                    phone = %s,
+                    timezone = %s,
+                    address = %s,
+                    website = %s
+                WHERE id = 1
+            """, (business_name, business_type, business_phone, business_timezone, business_address, business_website))
+        else:
+            cursor.execute("""
+                INSERT INTO businesses (id, name, type, phone, timezone, address, website)
+                VALUES (1, %s, %s, %s, %s, %s, %s)
+            """, (business_name, business_type, business_phone, business_timezone, business_address, business_website))
         
-        cursor.execute("""
-            INSERT INTO businesses (id, name, type, phone)
-            VALUES (1, %s, %s, %s)
-        """, (business_name, business_type, business_phone))
-        
-        # Insert services
+        # Upsert services
         services = config.get_services()
+        service_names = set()
         for service in services:
+            name = service['name']
+            service_names.add(name.lower())
             cursor.execute("""
-                INSERT INTO services (business_id, name, duration_minutes, price, active)
-                VALUES (1, %s, %s, %s, TRUE)
-            """, (
-                service['name'],
-                service.get('duration_minutes', 30),
-                service.get('price', 0)
-            ))
+                SELECT id FROM services WHERE business_id = 1 AND LOWER(name) = LOWER(%s)
+            """, (name,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("""
+                    UPDATE services
+                    SET duration_minutes = %s, price = %s, active = TRUE
+                    WHERE id = %s
+                """, (
+                    service.get('duration_minutes', 30),
+                    service.get('price', 0),
+                    existing['id']
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO services (business_id, name, duration_minutes, price, active)
+                    VALUES (1, %s, %s, %s, TRUE)
+                """, (
+                    name,
+                    service.get('duration_minutes', 30),
+                    service.get('price', 0)
+                ))
+        if service_names:
+            placeholders = ", ".join(["%s"] * len(service_names))
+            cursor.execute(
+                f"UPDATE services SET active = FALSE WHERE business_id = 1 AND LOWER(name) NOT IN ({placeholders})",
+                tuple(service_names)
+            )
+        else:
+            cursor.execute("UPDATE services SET active = FALSE WHERE business_id = 1")
         
-        # Insert staff
+        # Upsert staff
         staff = config.get_staff()
+        staff_names = set()
         for staff_member in staff:
+            name = staff_member['name']
+            staff_names.add(name.lower())
             cursor.execute("""
-                INSERT INTO staff (business_id, name, available)
-                VALUES (1, %s, %s)
-            """, (
-                staff_member['name'],
-                staff_member.get('available', True)
-            ))
+                SELECT id FROM staff WHERE business_id = 1 AND LOWER(name) = LOWER(%s)
+            """, (name,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("""
+                    UPDATE staff
+                    SET available = %s, email = %s
+                    WHERE id = %s
+                """, (
+                    staff_member.get('available', True),
+                    staff_member.get('email'),
+                    existing['id']
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO staff (business_id, name, available, email)
+                    VALUES (1, %s, %s, %s)
+                """, (
+                    name,
+                    staff_member.get('available', True),
+                    staff_member.get('email')
+                ))
+        if staff_names:
+            placeholders = ", ".join(["%s"] * len(staff_names))
+            cursor.execute(
+                f"UPDATE staff SET available = FALSE WHERE business_id = 1 AND LOWER(name) NOT IN ({placeholders})",
+                tuple(staff_names)
+            )
+        else:
+            cursor.execute("UPDATE staff SET available = FALSE WHERE business_id = 1")
         
-        # Insert business hours
+        # Upsert business hours
         hours = config.get_hours()
         day_map = {
             'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
             'friday': 4, 'saturday': 5, 'sunday': 6
         }
         
-        for day_name, day_hours in hours.items():
-            day_num = day_map.get(day_name.lower())
-            if day_num is not None:
-                open_time = day_hours.get('open')
-                close_time = day_hours.get('close')
-                is_closed = open_time is None or close_time is None
-                
+        for day_name, day_num in day_map.items():
+            day_hours = hours.get(day_name, {})
+            open_time = day_hours.get('open')
+            close_time = day_hours.get('close')
+            is_closed = open_time is None or close_time is None
+            cursor.execute("""
+                SELECT id FROM business_hours WHERE business_id = 1 AND day_of_week = %s
+            """, (day_num,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("""
+                    UPDATE business_hours
+                    SET open_time = %s, close_time = %s, is_closed = %s
+                    WHERE id = %s
+                """, (open_time, close_time, is_closed, existing['id']))
+            else:
                 cursor.execute("""
                     INSERT INTO business_hours 
                     (business_id, day_of_week, open_time, close_time, is_closed)
@@ -102,7 +174,7 @@ def init_business_data():
                 """, (day_num, open_time, close_time, is_closed))
         
         conn.commit()
-        print("Business data initialized successfully!")
+        print("Business data synced successfully!")
         print(f"  Business: {business_name}")
         print(f"  Services: {len(services)}")
         print(f"  Staff: {len(staff)}")
@@ -117,4 +189,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-

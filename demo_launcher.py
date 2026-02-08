@@ -12,8 +12,8 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 class DemoLauncher(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Voice Facilitator Demo Launcher")
-        self.geometry("520x360")
+        self.title("Voice Facilitator")
+        self.geometry("520x380")
         self.resizable(False, False)
 
         self.processes = {}
@@ -21,34 +21,32 @@ class DemoLauncher(tk.Tk):
         wrapper = ttk.Frame(self, padding=18)
         wrapper.pack(fill="both", expand=True)
 
-        title = ttk.Label(wrapper, text="Voice Facilitator Demo", font=("Helvetica", 16, "bold"))
+        title = ttk.Label(wrapper, text="Voice Facilitator", font=("Helvetica", 16, "bold"))
         title.pack(anchor="w")
 
         subtitle = ttk.Label(
             wrapper,
-            text="Launch each experience from here. Each button starts a separate process.",
+            text="Select a mode to continue.",
             foreground="#555555",
         )
         subtitle.pack(anchor="w", pady=(4, 14))
 
-        btn_frame = ttk.Frame(wrapper)
-        btn_frame.pack(fill="x")
+        self.mode_frame = ttk.Frame(wrapper)
+        self.mode_frame.pack(fill="x")
 
         self._add_button(
-            btn_frame,
-            "Start Voice Bot",
+            self.mode_frame,
+            "Customer Mode",
             lambda: self._launch("voice_bot", [sys.executable, "main.py"]),
         )
         self._add_button(
-            btn_frame,
-            "Open Admin Dashboard",
-            lambda: self._launch("dashboard", [sys.executable, "dashboard_dash.py"]),
+            self.mode_frame,
+            "Admin Mode",
+            self._show_admin_mode,
         )
-        self._add_button(
-            btn_frame,
-            "Admin Analytics (Voice)",
-            lambda: self._launch("admin_analytics", [sys.executable, "analytics_admin.py", "--voice"]),
-        )
+
+        self.admin_frame = ttk.Frame(wrapper)
+        self._build_admin_buttons()
 
         self.status = tk.StringVar(value="Ready.")
         status_label = ttk.Label(wrapper, textvariable=self.status, foreground="#2b2b2b")
@@ -63,6 +61,31 @@ class DemoLauncher(tk.Tk):
             foreground="#666666",
         )
         note.pack(anchor="w", pady=(14, 0))
+
+    def _build_admin_buttons(self):
+        self._add_button(
+            self.admin_frame,
+            "Open Admin Dashboard",
+            lambda: self._launch("dashboard", [sys.executable, "dashboard_dash.py"]),
+        )
+        self._add_button(
+            self.admin_frame,
+            "Conversational Analytics (Admin)",
+            lambda: self._launch("admin_analytics", [sys.executable, "analytics_admin.py", "--voice"]),
+        )
+        self._add_button(
+            self.admin_frame,
+            "Back",
+            self._show_mode_select,
+        )
+
+    def _show_admin_mode(self):
+        self.mode_frame.pack_forget()
+        self.admin_frame.pack(fill="x")
+
+    def _show_mode_select(self):
+        self.admin_frame.pack_forget()
+        self.mode_frame.pack(fill="x")
 
     def _add_button(self, parent, label, command):
         btn = ttk.Button(parent, text=label, command=command)

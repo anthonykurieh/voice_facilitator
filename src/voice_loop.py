@@ -139,7 +139,7 @@ class VoiceLoop:
                         if action == 'cancel_appointment' and action_result.get('success'):
                             self.call_outcome = self.call_outcome or 'cancelled'
                         if action == 'reschedule_appointment' and action_result.get('success'):
-                            self.call_outcome = self.call_outcome or 'rescheduled'
+                            self.call_outcome = self.call_outcome or 'modified'
                             if action_result.get('new_appointment_id'):
                                 self.call_appointment_id = action_result.get('new_appointment_id')
                         
@@ -156,14 +156,15 @@ class VoiceLoop:
                                     f"{suggestion} "
                                     f"Please inform the customer that the time slot was just taken and suggest alternative times from the available slots."
                                 )
-                                error_feedback = self.agent.process(booking_error_prompt)
+                                error_feedback = self.agent.process(booking_error_prompt, internal_prompt=True)
                                 response_text = error_feedback.get('response', response_text)
                                 logger.info(f"Assistant response after booking error: {response_text}")
                                 print(f"Assistant (booking error): {response_text}")
                             else:
                                 # Generic error handling
                                 error_feedback = self.agent.process(
-                                    f"The {action} action returned an error: {action_result['error']}. Please inform the customer and suggest alternatives."
+                                    f"The {action} action returned an error: {action_result['error']}. Please inform the customer and suggest alternatives.",
+                                    internal_prompt=True
                                 )
                                 response_text = error_feedback.get('response', response_text)
                                 logger.info(f"Assistant response after error: {response_text}")
@@ -177,7 +178,8 @@ class VoiceLoop:
                                 f"The check_availability action returned: {closed_message} "
                                 f"The business is closed on {day_name}. "
                                 f"Please inform the customer clearly and suggest alternative days when we are open. "
-                                f"Do not check availability again for the same day. Suggest Monday through Saturday instead."
+                                f"Do not check availability again for the same day. Suggest Monday through Saturday instead.",
+                                internal_prompt=True
                             )
                             response_text = closed_feedback.get('response', response_text)
                             logger.info(f"Assistant response for closed day: {response_text}")
@@ -216,10 +218,13 @@ class VoiceLoop:
                                         f"SUCCESS: Availability confirmed! The time slot {time_to_book or 'requested time'} is available on {day_name} ({date_str}). "
                                         f"Available slots: {', '.join(available_slots[:5])}. "
                                         f"IMPORTANT: You must now book the appointment. If you have the customer's name and phone from the conversation, use book_appointment action immediately with: "
-                                        f"date='{date_str}', time='{time_to_book or available_slots[0]}', service='Haircut', staff='Tony'. "
-                                        f"If you don't have customer info yet, ask for name and phone number NOW, then book immediately after getting it."
+                                        f"date='{date_str}', time='{time_to_book or available_slots[0]}'"
+                                        f"{', service=' + repr(action_params.get('service') or action_params.get('service_name')) if (action_params.get('service') or action_params.get('service_name')) else ''}"
+                                        f"{', staff=' + repr(action_params.get('staff')) if action_params.get('staff') else ''}. "
+                                        f"If you don't have customer info yet, ask for name and phone number NOW, then book immediately after getting it. "
+                                        f"If the service type hasn't been confirmed yet, ask for it before booking."
                                     )
-                                    booking_feedback = self.agent.process(booking_prompt)
+                                    booking_feedback = self.agent.process(booking_prompt, internal_prompt=True)
                                     response_text = booking_feedback.get('response', response_text)
                                     logger.info(f"Assistant response after availability confirmed: {response_text}")
                                     print(f"Assistant (availability confirmed): {response_text}")
@@ -230,7 +235,7 @@ class VoiceLoop:
                                         f"but the requested time may not be available. Available times: {', '.join(available_slots[:5])}. "
                                         f"Please inform the customer and suggest one of these available times, or ask if they'd like to book a different time."
                                     )
-                                    slots_feedback = self.agent.process(slots_prompt)
+                                    slots_feedback = self.agent.process(slots_prompt, internal_prompt=True)
                                     response_text = slots_feedback.get('response', response_text)
                                     logger.info(f"Assistant response for alternative slots: {response_text}")
                                     print(f"Assistant (alternative slots): {response_text}")
@@ -238,7 +243,8 @@ class VoiceLoop:
                                 # No slots available but not closed - inform agent
                                 no_slots_feedback = self.agent.process(
                                     f"The availability check found no available slots for the requested time. "
-                                    f"Please inform the customer and suggest alternative times or days."
+                                    f"Please inform the customer and suggest alternative times or days.",
+                                    internal_prompt=True
                                 )
                                 response_text = no_slots_feedback.get('response', response_text)
                                 logger.info(f"Assistant response for no slots: {response_text}")
@@ -249,7 +255,7 @@ class VoiceLoop:
                                     f"Appointment successfully booked! Details: {action_result.get('date')} at {action_result.get('time')}. "
                                     f"Please confirm the booking details with the customer and thank them."
                                 )
-                                confirm_feedback = self.agent.process(booking_confirmation)
+                                confirm_feedback = self.agent.process(booking_confirmation, internal_prompt=True)
                                 response_text = confirm_feedback.get('response', response_text)
                                 logger.info(f"Assistant response after booking: {response_text}")
                                 print(f"Assistant (booking confirmed): {response_text}")
@@ -260,9 +266,10 @@ class VoiceLoop:
                                         f"The customer wants to reschedule. Current appointment: "
                                         f"{apt.get('date')} at {apt.get('time')} "
                                         f"(Service: {apt.get('service')}, Staff: {apt.get('staff')}). "
-                                        f"Ask the customer for a new date and time, or offer to check the closest availability."
+                                        f"Ask the customer for a new date and time, and if they'd like to change the service type. "
+                                        f"Offer to check the closest availability if needed."
                                     )
-                                    reschedule_feedback = self.agent.process(reschedule_prompt)
+                                    reschedule_feedback = self.agent.process(reschedule_prompt, internal_prompt=True)
                                     response_text = reschedule_feedback.get('response', response_text)
                                     logger.info(f"Assistant response requesting new slot: {response_text}")
                                     print(f"Assistant (reschedule prompt): {response_text}")
@@ -273,9 +280,9 @@ class VoiceLoop:
                                     slots_prompt = (
                                         f"Reschedule availability for {day_name} ({date_str}): "
                                         f"{', '.join(available_slots[:10]) if available_slots else 'No slots'}. "
-                                        f"Ask the customer to pick a time, or offer to check another day."
+                                        f"Ask the customer to pick a time (and confirm the service type), or offer to check another day."
                                     )
-                                    slots_feedback = self.agent.process(slots_prompt)
+                                    slots_feedback = self.agent.process(slots_prompt, internal_prompt=True)
                                     response_text = slots_feedback.get('response', response_text)
                                     logger.info(f"Assistant response with reschedule slots: {response_text}")
                                     print(f"Assistant (reschedule slots): {response_text}")
@@ -284,7 +291,7 @@ class VoiceLoop:
                                         f"Appointment rescheduled. New time: {action_result.get('new_date')} at {action_result.get('new_time')}. "
                                         f"Confirm the change with the customer and thank them."
                                     )
-                                    reschedule_feedback = self.agent.process(reschedule_confirmation)
+                                    reschedule_feedback = self.agent.process(reschedule_confirmation, internal_prompt=True)
                                     response_text = reschedule_feedback.get('response', response_text)
                                     logger.info(f"Assistant response after reschedule: {response_text}")
                                     print(f"Assistant (rescheduled): {response_text}")
@@ -312,7 +319,7 @@ class VoiceLoop:
                                         f"Please inform the customer about their appointment(s) clearly, including the date and time. "
                                         f"If they want to modify/reschedule, ask what new date and time they prefer, then use reschedule_appointment action with appointment_id={appointments[0].get('id')}."
                                     )
-                                    appointments_feedback = self.agent.process(appointments_prompt)
+                                    appointments_feedback = self.agent.process(appointments_prompt, internal_prompt=True)
                                     response_text = appointments_feedback.get('response', response_text)
                                     logger.info(f"Assistant response after getting appointments: {response_text}")
                                     print(f"Assistant (appointments found): {response_text}")
@@ -322,7 +329,7 @@ class VoiceLoop:
                                         f"No appointments found for this customer. "
                                         f"Please inform the customer that no upcoming appointments were found."
                                     )
-                                    no_appointments_feedback = self.agent.process(no_appointments_prompt)
+                                    no_appointments_feedback = self.agent.process(no_appointments_prompt, internal_prompt=True)
                                     response_text = no_appointments_feedback.get('response', response_text)
                                     logger.info(f"Assistant response for no appointments: {response_text}")
                                     print(f"Assistant (no appointments): {response_text}")
@@ -331,7 +338,8 @@ class VoiceLoop:
                         logger.error(f"Exception during action execution: {e}", exc_info=True)
                         print(f"[ERROR executing action: {e}]")
                         error_feedback = self.agent.process(
-                            f"An error occurred: {str(e)}. Please inform the customer."
+                            f"An error occurred: {str(e)}. Please inform the customer.",
+                            internal_prompt=True
                         )
                         response_text = error_feedback.get('response', response_text)
                 
@@ -360,11 +368,12 @@ class VoiceLoop:
                 print(f"Assistant: {error_msg}")
                 self.tts.speak(error_msg)
         
-        # Closing
-        closing = "Thank you for calling. Have a great day!"
-        print(f"\nAssistant: {closing}")
-        self.tts.speak(self._humanize_times_in_text(closing))
-        self._log_turn("assistant", closing)
+        # Closing (skip if conversation already ended with a farewell)
+        if not conversation_complete:
+            closing = "Thank you for calling. Have a great day!"
+            print(f"\nAssistant: {closing}")
+            self.tts.speak(self._humanize_times_in_text(closing))
+            self._log_turn("assistant", closing)
         
         # Cleanup
         self.cleanup()

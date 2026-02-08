@@ -50,6 +50,9 @@ class Database:
                     name VARCHAR(255) NOT NULL,
                     type VARCHAR(100),
                     phone VARCHAR(50),
+                    timezone VARCHAR(100),
+                    address VARCHAR(255),
+                    website VARCHAR(255),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 )
@@ -89,10 +92,34 @@ class Database:
                     business_id INT,
                     name VARCHAR(255) NOT NULL,
                     available BOOLEAN DEFAULT TRUE,
+                    email VARCHAR(255),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (business_id) REFERENCES businesses(id) ON DELETE CASCADE
                 )
             """)
+            # Best-effort column additions for existing tables
+            try:
+                cursor.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS timezone VARCHAR(100)")
+                cursor.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS address VARCHAR(255)")
+                cursor.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS website VARCHAR(255)")
+            except Exception:
+                # MySQL <8 may not support IF NOT EXISTS on ALTER
+                for stmt in (
+                    "ALTER TABLE businesses ADD COLUMN timezone VARCHAR(100)",
+                    "ALTER TABLE businesses ADD COLUMN address VARCHAR(255)",
+                    "ALTER TABLE businesses ADD COLUMN website VARCHAR(255)",
+                ):
+                    try:
+                        cursor.execute(stmt)
+                    except Exception:
+                        pass
+            try:
+                cursor.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
+            except Exception:
+                try:
+                    cursor.execute("ALTER TABLE staff ADD COLUMN email VARCHAR(255)")
+                except Exception:
+                    pass
             
             # Business hours table
             cursor.execute("""
@@ -227,14 +254,52 @@ class Database:
             """, (transcript, call_id))
             conn.commit()
     
-    def get_available_slots(self, date: date, staff_id: Optional[int] = None, 
-                           duration_minutes: int = 30) -> List[Dict[str, Any]]:
+    def get_business_hours_for_date(self, day: date) -> Optional[Dict[str, Any]]:
+        """Return business hours for a given date (from DB)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            day_of_week = day.weekday()  # 0=Monday, 6=Sunday
+            cursor.execute("""
+                SELECT open_time, close_time, is_closed
+                FROM business_hours
+                WHERE business_id = 1 AND day_of_week = %s
+            """, (day_of_week,))
+            hours = cursor.fetchone()
+            if not hours:
+                return None
+
+            open_time = hours['open_time']
+            close_time = hours['close_time']
+
+            if isinstance(open_time, timedelta):
+                total_seconds = int(open_time.total_seconds())
+                hours_part = total_seconds // 3600
+                minutes_part = (total_seconds % 3600) // 60
+                open_time = time(hours_part, minutes_part)
+
+            if isinstance(close_time, timedelta):
+                total_seconds = int(close_time.total_seconds())
+                hours_part = total_seconds // 3600
+                minutes_part = (total_seconds % 3600) // 60
+                close_time = time(hours_part, minutes_part)
+
+            return {
+                "open_time": open_time,
+                "close_time": close_time,
+                "is_closed": bool(hours.get("is_closed"))
+            }
+
+    def get_available_slots(self, date: date, staff_id: Optional[int] = None,
+                           duration_minutes: int = 30,
+                           buffer_minutes: int = 0,
+                           exclude_appointment_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get available time slots for a given date.
         
         Args:
             date: Date to check availability
             staff_id: Optional staff member ID to filter by
             duration_minutes: Duration of appointment in minutes
+            buffer_minutes: Buffer between appointments in minutes
             
         Returns:
             List of available time slots
@@ -243,38 +308,13 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Get business hours for the day
-            day_of_week = date.weekday()  # 0=Monday, 6=Sunday
-            cursor.execute("""
-                SELECT open_time, close_time, is_closed
-                FROM business_hours
-                WHERE business_id = 1 AND day_of_week = %s
-            """, (day_of_week,))
-            
-            hours = cursor.fetchone()
-            if not hours or hours['is_closed']:
-                logger.warning(f"Business is closed on {date} (day of week: {day_of_week})")
+            hours = self.get_business_hours_for_date(date)
+            if not hours or hours.get("is_closed"):
+                logger.warning(f"Business is closed on {date}")
                 return []  # Return empty list - caller should check if business is closed
-            
-            open_time = hours['open_time']
-            close_time = hours['close_time']
-            logger.debug(f"Raw times from DB - open_time type: {type(open_time)}, value: {open_time}, close_time type: {type(close_time)}, value: {close_time}")
-            
-            # Convert timedelta to time if needed (MySQL TIME returns as timedelta)
-            if isinstance(open_time, timedelta):
-                total_seconds = int(open_time.total_seconds())
-                hours_part = total_seconds // 3600
-                minutes_part = (total_seconds % 3600) // 60
-                open_time = time(hours_part, minutes_part)
-                logger.debug(f"Converted open_time from timedelta to time: {open_time}")
-            
-            if isinstance(close_time, timedelta):
-                total_seconds = int(close_time.total_seconds())
-                hours_part = total_seconds // 3600
-                minutes_part = (total_seconds % 3600) // 60
-                close_time = time(hours_part, minutes_part)
-                logger.debug(f"Converted close_time from timedelta to time: {close_time}")
-            
+
+            open_time = hours["open_time"]
+            close_time = hours["close_time"]
             logger.info(f"Business hours: {open_time} - {close_time}")
             
             # Get existing appointments
@@ -288,6 +328,9 @@ class Database:
             if staff_id:
                 query += " AND staff_id = %s"
                 params.append(staff_id)
+            if exclude_appointment_id:
+                query += " AND id != %s"
+                params.append(exclude_appointment_id)
             
             cursor.execute(query, params)
             appointments = cursor.fetchall()
@@ -314,6 +357,9 @@ class Database:
                         apt_time = time(hours_part, minutes_part)
                     apt_start = datetime.combine(date, apt_time)
                     apt_end = apt_start + timedelta(minutes=apt['duration_minutes'])
+                    if buffer_minutes:
+                        apt_start = apt_start - timedelta(minutes=buffer_minutes)
+                        apt_end = apt_end + timedelta(minutes=buffer_minutes)
                     
                     if not (slot_end <= apt_start or current >= apt_end):
                         slot_available = False
@@ -336,7 +382,9 @@ class Database:
                           appointment_date: date, appointment_time: time,
                           duration_minutes: int, notes: Optional[str] = None,
                           service_name: Optional[str] = None,
-                          service_price: Optional[float] = None) -> int:
+                          service_price: Optional[float] = None,
+                          buffer_minutes: int = 0,
+                          exclude_appointment_id: Optional[int] = None) -> int:
         """Create a new appointment.
         
         CRITICAL: This function checks for conflicts before booking to prevent double-booking.
@@ -373,6 +421,11 @@ class Database:
                 staff_id
             ))
             existing_appointments = cursor.fetchall()
+            if exclude_appointment_id:
+                existing_appointments = [
+                    apt for apt in existing_appointments
+                    if apt.get("id") != exclude_appointment_id
+                ]
             
             # Check for time overlaps
             for existing in existing_appointments:
@@ -386,6 +439,9 @@ class Database:
                 
                 existing_start = datetime.combine(appointment_date, existing_time)
                 existing_end = existing_start + timedelta(minutes=existing['duration_minutes'])
+                if buffer_minutes:
+                    existing_start = existing_start - timedelta(minutes=buffer_minutes)
+                    existing_end = existing_end + timedelta(minutes=buffer_minutes)
                 
                 # Check if appointments overlap
                 if not (appointment_end <= existing_start or appointment_start >= existing_end):
@@ -466,8 +522,9 @@ class Database:
                 conn.commit()
                 return cursor.lastrowid
     
-    def get_customer_appointments(self, customer_id: int, 
-                                  upcoming_only: bool = True) -> List[Dict[str, Any]]:
+    def get_customer_appointments(self, customer_id: int,
+                                  upcoming_only: bool = True,
+                                  today: Optional[date] = None) -> List[Dict[str, Any]]:
         """Get appointments for a customer."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -479,10 +536,16 @@ class Database:
                 WHERE a.customer_id = %s
             """
             if upcoming_only:
-                query += " AND a.appointment_date >= CURDATE() AND a.status = 'scheduled'"
+                if today:
+                    query += " AND a.appointment_date >= %s AND a.status = 'scheduled'"
+                else:
+                    query += " AND a.appointment_date >= CURDATE() AND a.status = 'scheduled'"
             query += " ORDER BY a.appointment_date, a.appointment_time"
-            
-            cursor.execute(query, (customer_id,))
+
+            if upcoming_only and today:
+                cursor.execute(query, (customer_id, today))
+            else:
+                cursor.execute(query, (customer_id,))
             return cursor.fetchall()
     
     def cancel_appointment(self, appointment_id: int) -> bool:
