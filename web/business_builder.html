@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Business Config Builder</title>
+  <style>
+    :root {
+      --bg: #eef2ff;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --primary: #0f766e;
+      --primary-2: #1d4ed8;
+      --border: #dbe3ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background:
+        radial-gradient(circle at 20% 10%, #d1fae5, transparent 35%),
+        radial-gradient(circle at 80% 0%, #dbeafe, transparent 40%),
+        var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }
+    .container { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+    .hero {
+      background: linear-gradient(135deg, var(--primary), var(--primary-2));
+      color: white;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18);
+    }
+    .hero h1 { margin: 0 0 6px; font-size: 30px; }
+    .hero p { margin: 0; opacity: 0.95; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .06em; }
+    input, select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 14px;
+    }
+    .row {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 10px;
+      background: #f8fafc;
+    }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; }
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn-primary { background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: white; }
+    .btn-secondary { background: #e5e7eb; color: #111827; }
+    .status {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #f8fafc;
+      font-size: 14px;
+    }
+    .hours-grid { display: grid; gap: 8px; }
+    .hours-row { display: grid; grid-template-columns: 120px 1fr 1fr 120px; gap: 10px; align-items: center; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .color-field {
+      display: grid;
+      grid-template-columns: 54px 1fr;
+      gap: 8px;
+      align-items: center;
+    }
+    input[type="color"] {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      height: 38px;
+      padding: 2px;
+      width: 54px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .palette-preview {
+      margin-top: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      background: #fff;
+    }
+    .palette-hero {
+      color: #fff;
+      padding: 10px 12px;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .palette-swatches {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      min-height: 22px;
+    }
+    .palette-swatches div { min-height: 22px; }
+    @media (max-width: 860px) {
+      .grid, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      .hours-row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="hero">
+      <h1>Business Config Builder</h1>
+      <p>Create a new <span class="mono">config/business_config_*.yaml</span> from a visual form.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Business</h2>
+      <div class="grid">
+        <div><label>Name</label><input id="business_name" placeholder="e.g., Sunset Dental Studio"></div>
+        <div><label>Type</label><input id="business_type" placeholder="e.g., dental_clinic"></div>
+        <div><label>Phone</label><input id="business_phone" placeholder="e.g., +1-555-0188"></div>
+        <div><label>Timezone</label><input id="business_timezone" placeholder="e.g., America/Los_Angeles"></div>
+        <div class="grid" style="grid-column: 1 / -1;">
+          <div><label>Address</label><input id="business_address" placeholder="e.g., 900 Ocean Ave, Santa Monica, CA"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Personality</h2>
+      <div class="grid">
+        <div><label>Tone</label><input id="tone" placeholder="e.g., calm, clear, and reassuring"></div>
+        <div><label>Greeting</label><input id="greeting" placeholder="e.g., Hello! Thanks for calling {business_name}. How can I help you today?"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Services</h2>
+      <div id="services"></div>
+      <div class="btns"><button class="btn-secondary" id="add_service">Add Service</button></div>
+    </section>
+
+    <section class="panel">
+      <h2>Staff</h2>
+      <div id="staff"></div>
+      <div class="btns"><button class="btn-secondary" id="add_staff">Add Staff</button></div>
+    </section>
+
+    <section class="panel">
+      <h2>Hours</h2>
+      <div class="hours-grid" id="hours"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Booking Rules</h2>
+      <div class="grid-3">
+        <div><label>Advance Booking Days</label><input id="advance_days" type="number" placeholder="30"></div>
+        <div><label>Minimum Notice Hours</label><input id="notice_hours" type="number" placeholder="2"></div>
+        <div><label>Buffer Between Appointments</label><input id="buffer_min" type="number" placeholder="5"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Email Theme</h2>
+      <div class="grid">
+        <div>
+          <label>Palette Preset</label>
+          <select id="palette_preset">
+            <option value="custom">Custom</option>
+            <option value="barber_noir">Executive Noir (Barber)</option>
+            <option value="wellness_lagoon">Lagoon Mint (Wellness)</option>
+            <option value="sunset_luxe">Sunset Luxe</option>
+            <option value="neon_ice">Neon Ice</option>
+          </select>
+        </div>
+        <div>
+          <label>Palette Name</label>
+          <input id="palette_name" placeholder="e.g., Aurora Luxe">
+        </div>
+      </div>
+      <div class="grid-3">
+        <div>
+          <label>Hero Gradient Start</label>
+          <div class="color-field"><input type="color" id="hero_start_picker" value="#0f172a"><input id="hero_start" value="#0f172a" placeholder="#0f172a"></div>
+        </div>
+        <div>
+          <label>Hero Gradient End</label>
+          <div class="color-field"><input type="color" id="hero_end_picker" value="#7c3aed"><input id="hero_end" value="#7c3aed" placeholder="#7c3aed"></div>
+        </div>
+        <div>
+          <label>Accent</label>
+          <div class="color-field"><input type="color" id="accent_picker" value="#f97316"><input id="accent" value="#f97316" placeholder="#f97316"></div>
+        </div>
+        <div>
+          <label>Accent Soft</label>
+          <div class="color-field"><input type="color" id="accent_soft_picker" value="#ffedd5"><input id="accent_soft" value="#ffedd5" placeholder="#ffedd5"></div>
+        </div>
+        <div>
+          <label>Table Header BG</label>
+          <div class="color-field"><input type="color" id="header_bg_picker" value="#f8fafc"><input id="header_bg" value="#f8fafc" placeholder="#f8fafc"></div>
+        </div>
+        <div>
+          <label>Table Header Text</label>
+          <div class="color-field"><input type="color" id="header_text_picker" value="#111827"><input id="header_text" value="#111827" placeholder="#111827"></div>
+        </div>
+        <div>
+          <label>Panel BG</label>
+          <div class="color-field"><input type="color" id="panel_bg_picker" value="#fff7ed"><input id="panel_bg" value="#fff7ed" placeholder="#fff7ed"></div>
+        </div>
+        <div>
+          <label>Border</label>
+          <div class="color-field"><input type="color" id="border_picker" value="#fed7aa"><input id="border" value="#fed7aa" placeholder="#fed7aa"></div>
+        </div>
+      </div>
+      <div class="palette-preview">
+        <div id="palette_hero_preview" class="palette-hero">Theme Preview</div>
+        <div class="palette-swatches">
+          <div id="sw_accent"></div>
+          <div id="sw_accent_soft"></div>
+          <div id="sw_header_bg"></div>
+          <div id="sw_panel_bg"></div>
+          <div id="sw_border"></div>
+        </div>
+      </div>
+      <div class="hint">Tip: use preset palettes for quick starts, then fine tune with color pickers.</div>
+    </section>
+
+    <section class="panel">
+      <div class="btns">
+        <button class="btn-primary" id="save_btn">Create Config File</button>
+        <button class="btn-secondary" id="fill_barber">Template: Barber</button>
+        <button class="btn-secondary" id="fill_wellness">Template: Wellness</button>
+      </div>
+      <div id="status" class="status" style="margin-top: 12px;">Ready.</div>
+    </section>
+  </div>
+
+  <script>
+    const servicesEl = document.getElementById("services");
+    const staffEl = document.getElementById("staff");
+    const hoursEl = document.getElementById("hours");
+    const statusEl = document.getElementById("status");
+    const dayNames = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+    const colorKeys = [
+      "hero_start", "hero_end", "accent", "accent_soft",
+      "header_bg", "header_text", "panel_bg", "border"
+    ];
+    const palettePresets = {
+      custom: null,
+      barber_noir: {
+        palette_name: "Executive Noir",
+        hero_start: "#111827",
+        hero_end: "#7c2d12",
+        accent: "#f59e0b",
+        accent_soft: "#fef3c7",
+        header_bg: "#fff7ed",
+        header_text: "#7c2d12",
+        panel_bg: "#fffbeb",
+        border: "#fed7aa"
+      },
+      wellness_lagoon: {
+        palette_name: "Lagoon Mint",
+        hero_start: "#0f172a",
+        hero_end: "#0f766e",
+        accent: "#22c55e",
+        accent_soft: "#dcfce7",
+        header_bg: "#ecfeff",
+        header_text: "#115e59",
+        panel_bg: "#f0fdfa",
+        border: "#99f6e4"
+      },
+      sunset_luxe: {
+        palette_name: "Sunset Luxe",
+        hero_start: "#7c2d12",
+        hero_end: "#be123c",
+        accent: "#fb7185",
+        accent_soft: "#ffe4e6",
+        header_bg: "#fff1f2",
+        header_text: "#9f1239",
+        panel_bg: "#fff7ed",
+        border: "#fdba74"
+      },
+      neon_ice: {
+        palette_name: "Neon Ice",
+        hero_start: "#0f172a",
+        hero_end: "#0e7490",
+        accent: "#06b6d4",
+        accent_soft: "#cffafe",
+        header_bg: "#ecfeff",
+        header_text: "#155e75",
+        panel_bg: "#f0f9ff",
+        border: "#93c5fd"
+      }
+    };
+
+    function normalizeHex(value) {
+      const raw = (value || "").trim();
+      if (!raw) return null;
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const ok = /^#[0-9a-fA-F]{6}$/.test(withHash);
+      return ok ? withHash.toLowerCase() : null;
+    }
+
+    function setColorField(key, hex) {
+      const txt = document.getElementById(key);
+      const picker = document.getElementById(`${key}_picker`);
+      if (!txt || !picker) return;
+      txt.value = hex;
+      picker.value = hex;
+    }
+
+    function refreshPalettePreview() {
+      const hs = normalizeHex(document.getElementById("hero_start").value) || "#0f172a";
+      const he = normalizeHex(document.getElementById("hero_end").value) || "#1d4ed8";
+      const accent = normalizeHex(document.getElementById("accent").value) || "#2563eb";
+      const accentSoft = normalizeHex(document.getElementById("accent_soft").value) || "#dbeafe";
+      const hdrBg = normalizeHex(document.getElementById("header_bg").value) || "#f1f5f9";
+      const panelBg = normalizeHex(document.getElementById("panel_bg").value) || "#f8fafc";
+      const border = normalizeHex(document.getElementById("border").value) || "#e2e8f0";
+      const name = document.getElementById("palette_name").value || "Theme Preview";
+      const hero = document.getElementById("palette_hero_preview");
+      hero.textContent = name;
+      hero.style.background = `linear-gradient(135deg, ${hs}, ${he})`;
+      document.getElementById("sw_accent").style.background = accent;
+      document.getElementById("sw_accent_soft").style.background = accentSoft;
+      document.getElementById("sw_header_bg").style.background = hdrBg;
+      document.getElementById("sw_panel_bg").style.background = panelBg;
+      document.getElementById("sw_border").style.background = border;
+      document.querySelector(".palette-preview").style.borderColor = border;
+    }
+
+    function wireColorSync(key) {
+      const txt = document.getElementById(key);
+      const picker = document.getElementById(`${key}_picker`);
+      if (!txt || !picker) return;
+      picker.addEventListener("input", () => {
+        txt.value = picker.value;
+        refreshPalettePreview();
+      });
+      txt.addEventListener("input", () => {
+        const n = normalizeHex(txt.value);
+        if (n) picker.value = n;
+        refreshPalettePreview();
+      });
+    }
+
+    function serviceRow(name = "", duration = "", price = "") {
+      const wrap = document.createElement("div");
+      wrap.className = "row";
+      wrap.innerHTML = `
+        <div class="grid-3">
+          <div><label>Service Name</label><input class="svc-name" value="${name}" placeholder="e.g., Haircut"></div>
+          <div><label>Duration (min)</label><input class="svc-duration" type="number" value="${duration}" placeholder="30"></div>
+          <div><label>Price</label><input class="svc-price" type="number" step="0.01" value="${price}" placeholder="25"></div>
+        </div>
+        <div class="btns" style="margin-top:10px"><button class="btn-secondary remove">Remove</button></div>
+      `;
+      wrap.querySelector(".remove").onclick = () => wrap.remove();
+      servicesEl.appendChild(wrap);
+    }
+
+    function staffRow(name = "", email = "", available = true) {
+      const wrap = document.createElement("div");
+      wrap.className = "row";
+      wrap.innerHTML = `
+        <div class="grid-3">
+          <div><label>Staff Name</label><input class="st-name" value="${name}" placeholder="e.g., Tony"></div>
+          <div><label>Email</label><input class="st-email" value="${email}" placeholder="name@company.com"></div>
+          <div><label>Available</label><select class="st-av"><option value="true">true</option><option value="false">false</option></select></div>
+        </div>
+        <div class="btns" style="margin-top:10px"><button class="btn-secondary remove">Remove</button></div>
+      `;
+      wrap.querySelector(".st-av").value = String(available);
+      wrap.querySelector(".remove").onclick = () => wrap.remove();
+      staffEl.appendChild(wrap);
+    }
+
+    function hourRow(day, open = "09:00", close = "18:00", closed = false) {
+      const row = document.createElement("div");
+      row.className = "hours-row row";
+      row.innerHTML = `
+        <strong style="text-transform:capitalize">${day}</strong>
+        <div><label>Open</label><input type="time" class="h-open" value="${open}"></div>
+        <div><label>Close</label><input type="time" class="h-close" value="${close}"></div>
+        <div><label>Closed</label><select class="h-closed"><option value="false">false</option><option value="true">true</option></select></div>
+      `;
+      row.dataset.day = day;
+      row.querySelector(".h-closed").value = String(closed);
+      hoursEl.appendChild(row);
+    }
+
+    function collect() {
+      const services = [...servicesEl.querySelectorAll(".row")].map(r => ({
+        name: r.querySelector(".svc-name").value,
+        duration_minutes: Number(r.querySelector(".svc-duration").value || 30),
+        price: Number(r.querySelector(".svc-price").value || 0)
+      }));
+      const staff = [...staffEl.querySelectorAll(".row")].map(r => ({
+        name: r.querySelector(".st-name").value,
+        email: r.querySelector(".st-email").value,
+        available: r.querySelector(".st-av").value === "true"
+      }));
+      const hours = {};
+      [...hoursEl.querySelectorAll(".hours-row")].forEach(r => {
+        const day = r.dataset.day;
+        hours[day] = {
+          open: r.querySelector(".h-open").value,
+          close: r.querySelector(".h-close").value,
+          closed: r.querySelector(".h-closed").value === "true"
+        };
+      });
+      return {
+        business: {
+          name: document.getElementById("business_name").value,
+          type: document.getElementById("business_type").value,
+          phone: document.getElementById("business_phone").value,
+          timezone: document.getElementById("business_timezone").value,
+          address: document.getElementById("business_address").value
+        },
+        personality: {
+          tone: document.getElementById("tone").value,
+          greeting: document.getElementById("greeting").value
+        },
+        services,
+        staff,
+        hours,
+        booking: {
+          advance_booking_days: Number(document.getElementById("advance_days").value || 30),
+          minimum_notice_hours: Number(document.getElementById("notice_hours").value || 2),
+          buffer_between_appointments_minutes: Number(document.getElementById("buffer_min").value || 5)
+        },
+        email_theme: {
+          palette_name: document.getElementById("palette_name").value,
+          hero_gradient_start: document.getElementById("hero_start").value,
+          hero_gradient_end: document.getElementById("hero_end").value,
+          accent: document.getElementById("accent").value,
+          accent_soft: document.getElementById("accent_soft").value,
+          table_header_bg: document.getElementById("header_bg").value,
+          table_header_text: document.getElementById("header_text").value,
+          panel_bg: document.getElementById("panel_bg").value,
+          border: document.getElementById("border").value
+        }
+      };
+    }
+
+    async function saveConfig() {
+      statusEl.textContent = "Creating config...";
+      try {
+        const res = await fetch("/api/create-business", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collect())
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed");
+        statusEl.innerHTML = `Created: <strong class="mono">${data.file}</strong>. Refresh configs in launcher.`;
+      } catch (e) {
+        statusEl.textContent = `Error: ${e.message}`;
+      }
+    }
+
+    function fillTemplate(kind) {
+      if (kind === "barber") {
+        document.getElementById("business_name").value = "Northline Barber Lab";
+        document.getElementById("business_type").value = "barber";
+        document.getElementById("tone").value = "sharp, upbeat, and professional";
+        servicesEl.innerHTML = "";
+        staffEl.innerHTML = "";
+        serviceRow("Haircut", 30, 28);
+        serviceRow("Beard Trim", 20, 18);
+        serviceRow("Full Service", 45, 40);
+        staffRow("Tony", "anthony.kurieh@outlook.com", true);
+        staffRow("Ralph", "anthony.kurieh@outlook.com", true);
+        applyPalette("barber_noir");
+      } else {
+        document.getElementById("business_name").value = "Luna Wellness House";
+        document.getElementById("business_type").value = "wellness_studio";
+        document.getElementById("tone").value = "calm, warm, and reassuring";
+        servicesEl.innerHTML = "";
+        staffEl.innerHTML = "";
+        serviceRow("Deep Tissue Massage", 60, 120);
+        serviceRow("Facial Reset", 50, 95);
+        serviceRow("Recovery Bundle", 90, 165);
+        staffRow("Avery", "anthony.kurieh@outlook.com", true);
+        staffRow("Nora", "anthony.kurieh@outlook.com", true);
+        applyPalette("wellness_lagoon");
+      }
+    }
+
+    function applyPalette(key) {
+      const palette = palettePresets[key];
+      if (!palette) return;
+      document.getElementById("palette_name").value = palette.palette_name;
+      setColorField("hero_start", palette.hero_start);
+      setColorField("hero_end", palette.hero_end);
+      setColorField("accent", palette.accent);
+      setColorField("accent_soft", palette.accent_soft);
+      setColorField("header_bg", palette.header_bg);
+      setColorField("header_text", palette.header_text);
+      setColorField("panel_bg", palette.panel_bg);
+      setColorField("border", palette.border);
+      refreshPalettePreview();
+    }
+
+    document.getElementById("add_service").onclick = () => serviceRow();
+    document.getElementById("add_staff").onclick = () => staffRow();
+    document.getElementById("save_btn").onclick = saveConfig;
+    document.getElementById("fill_barber").onclick = () => fillTemplate("barber");
+    document.getElementById("fill_wellness").onclick = () => fillTemplate("wellness");
+    document.getElementById("palette_preset").addEventListener("change", (e) => {
+      if (e.target.value !== "custom") applyPalette(e.target.value);
+    });
+    document.getElementById("palette_name").addEventListener("input", refreshPalettePreview);
+    colorKeys.forEach(wireColorSync);
+
+    serviceRow();
+    staffRow();
+    dayNames.forEach((day, idx) => hourRow(day, "09:00", idx === 5 ? "16:00" : "18:00", idx === 6));
+    refreshPalettePreview();
+  </script>
+</body>
+</html>

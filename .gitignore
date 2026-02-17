@@ -6,7 +6,7 @@ __pycache__/
 env/
 venv/
 ENV/
-.venv
+.venv/
 .env
 *.log
 *.db
@@ -14,8 +14,13 @@ ENV/
 .DS_Store
 *.wav
 *.mp3
-config/business_config.yaml
+
+# Local business config files created via builder/UI
+config/business_config*.yaml
 
 client_secret.json
 .gcal_token.json
 .gcal_event_map.json
+
+# Local web/build artifacts
+web/.DS_Store

@@ -50,8 +50,15 @@ def init_business_data():
         business_address = config.get('business.address')
         business_website = config.get('business.website')
 
-        cursor.execute("SELECT id FROM businesses WHERE id = 1")
-        if cursor.fetchone():
+        cursor.execute("""
+            SELECT id
+            FROM businesses
+            WHERE LOWER(name) = LOWER(%s)
+            LIMIT 1
+        """, (business_name,))
+        existing_business = cursor.fetchone()
+        if existing_business:
+            business_id = existing_business["id"]
             cursor.execute("""
                 UPDATE businesses
                 SET name = %s,
@@ -60,13 +67,14 @@ def init_business_data():
                     timezone = %s,
                     address = %s,
                     website = %s
-                WHERE id = 1
-            """, (business_name, business_type, business_phone, business_timezone, business_address, business_website))
+                WHERE id = %s
+            """, (business_name, business_type, business_phone, business_timezone, business_address, business_website, business_id))
         else:
             cursor.execute("""
-                INSERT INTO businesses (id, name, type, phone, timezone, address, website)
-                VALUES (1, %s, %s, %s, %s, %s, %s)
+                INSERT INTO businesses (name, type, phone, timezone, address, website)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (business_name, business_type, business_phone, business_timezone, business_address, business_website))
+            business_id = cursor.lastrowid
         
         # Upsert services
         services = config.get_services()
@@ -75,8 +83,8 @@ def init_business_data():
             name = service['name']
             service_names.add(name.lower())
             cursor.execute("""
-                SELECT id FROM services WHERE business_id = 1 AND LOWER(name) = LOWER(%s)
-            """, (name,))
+                SELECT id FROM services WHERE business_id = %s AND LOWER(name) = LOWER(%s)
+            """, (business_id, name))
             existing = cursor.fetchone()
             if existing:
                 cursor.execute("""
@@ -91,8 +99,9 @@ def init_business_data():
             else:
                 cursor.execute("""
                     INSERT INTO services (business_id, name, duration_minutes, price, active)
-                    VALUES (1, %s, %s, %s, TRUE)
+                    VALUES (%s, %s, %s, %s, TRUE)
                 """, (
+                    business_id,
                     name,
                     service.get('duration_minutes', 30),
                     service.get('price', 0)
@@ -100,11 +109,11 @@ def init_business_data():
         if service_names:
             placeholders = ", ".join(["%s"] * len(service_names))
             cursor.execute(
-                f"UPDATE services SET active = FALSE WHERE business_id = 1 AND LOWER(name) NOT IN ({placeholders})",
-                tuple(service_names)
+                f"UPDATE services SET active = FALSE WHERE business_id = %s AND LOWER(name) NOT IN ({placeholders})",
+                (business_id, *tuple(service_names))
             )
         else:
-            cursor.execute("UPDATE services SET active = FALSE WHERE business_id = 1")
+            cursor.execute("UPDATE services SET active = FALSE WHERE business_id = %s", (business_id,))
         
         # Upsert staff
         staff = config.get_staff()
@@ -113,8 +122,8 @@ def init_business_data():
             name = staff_member['name']
             staff_names.add(name.lower())
             cursor.execute("""
-                SELECT id FROM staff WHERE business_id = 1 AND LOWER(name) = LOWER(%s)
-            """, (name,))
+                SELECT id FROM staff WHERE business_id = %s AND LOWER(name) = LOWER(%s)
+            """, (business_id, name))
             existing = cursor.fetchone()
             if existing:
                 cursor.execute("""
@@ -129,8 +138,9 @@ def init_business_data():
             else:
                 cursor.execute("""
                     INSERT INTO staff (business_id, name, available, email)
-                    VALUES (1, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s)
                 """, (
+                    business_id,
                     name,
                     staff_member.get('available', True),
                     staff_member.get('email')
@@ -138,11 +148,11 @@ def init_business_data():
         if staff_names:
             placeholders = ", ".join(["%s"] * len(staff_names))
             cursor.execute(
-                f"UPDATE staff SET available = FALSE WHERE business_id = 1 AND LOWER(name) NOT IN ({placeholders})",
-                tuple(staff_names)
+                f"UPDATE staff SET available = FALSE WHERE business_id = %s AND LOWER(name) NOT IN ({placeholders})",
+                (business_id, *tuple(staff_names))
             )
         else:
-            cursor.execute("UPDATE staff SET available = FALSE WHERE business_id = 1")
+            cursor.execute("UPDATE staff SET available = FALSE WHERE business_id = %s", (business_id,))
         
         # Upsert business hours
         hours = config.get_hours()
@@ -157,8 +167,8 @@ def init_business_data():
             close_time = day_hours.get('close')
             is_closed = open_time is None or close_time is None
             cursor.execute("""
-                SELECT id FROM business_hours WHERE business_id = 1 AND day_of_week = %s
-            """, (day_num,))
+                SELECT id FROM business_hours WHERE business_id = %s AND day_of_week = %s
+            """, (business_id, day_num))
             existing = cursor.fetchone()
             if existing:
                 cursor.execute("""
@@ -170,15 +180,23 @@ def init_business_data():
                 cursor.execute("""
                     INSERT INTO business_hours 
                     (business_id, day_of_week, open_time, close_time, is_closed)
-                    VALUES (1, %s, %s, %s, %s)
-                """, (day_num, open_time, close_time, is_closed))
-        
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (business_id, day_num, open_time, close_time, is_closed))
+
         conn.commit()
+        # Persist the resolved business id back into the active config so runtime uses the same tenant.
+        config.config.setdefault("business", {})
+        config.config["business"]["id"] = int(business_id)
+        with open(config_path, "w", encoding="utf-8") as f:
+            import yaml
+            yaml.safe_dump(config.config, f, sort_keys=False, allow_unicode=True)
         print("Business data synced successfully!")
+        print(f"  Business ID: {business_id}")
         print(f"  Business: {business_name}")
         print(f"  Services: {len(services)}")
         print(f"  Staff: {len(staff)}")
         print(f"  Hours: {len(hours)} days configured")
+        return int(business_id)
 
 
 if __name__ == "__main__":

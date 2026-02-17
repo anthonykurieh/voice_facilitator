@@ -48,6 +48,13 @@ def get_engine() -> Engine:
     return create_engine(f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}")
 
 
+def list_businesses(engine: Engine):
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, name FROM businesses ORDER BY id")).mappings().all()
+    businesses = [{"id": int(r["id"]), "name": r["name"]} for r in rows]
+    return businesses
+
+
 def safe_execute(engine: Engine, sql: str):
     sql_lower = sql.lower()
     if not sql_lower.strip().startswith("select"):
@@ -107,14 +114,16 @@ def coerce_time_value(value):
         return pd.NaT
 
 
-def load_data(engine: Engine, start: Optional[date] = None, end: Optional[date] = None):
+def load_data(engine: Engine, start: Optional[date] = None, end: Optional[date] = None, business_ids: Optional[list] = None):
     today = date.today()
     start = start or (today - timedelta(days=89))
     end = end or today
-    appts = fetch_df(
-        engine,
-        """
-        SELECT a.id, a.appointment_date, a.appointment_time, a.duration_minutes, a.status,
+    business_ids = [int(b) for b in (business_ids or [])]
+    has_business_filter = len(business_ids) > 0
+    placeholders = ", ".join(["%s"] * len(business_ids))
+
+    appt_query = """
+        SELECT a.id, a.business_id, a.appointment_date, a.appointment_time, a.duration_minutes, a.status,
                a.created_at, a.staff_id, a.service_id,
                s.name AS service_name, s.price AS service_price, s.duration_minutes AS service_duration,
                st.name AS staff_name
@@ -122,28 +131,59 @@ def load_data(engine: Engine, start: Optional[date] = None, end: Optional[date] 
         LEFT JOIN services s ON a.service_id = s.id
         LEFT JOIN staff st ON a.staff_id = st.id
         WHERE a.appointment_date BETWEEN %s AND %s
-        """,
-        [start, end],
+    """
+    appt_params = [start, end]
+    if has_business_filter:
+        appt_query += f" AND a.business_id IN ({placeholders})"
+        appt_params.extend(business_ids)
+
+    appts = fetch_df(
+        engine,
+        appt_query,
+        appt_params,
     )
+
+    # KPI events table does not store business_id directly; scope through appointment_id.
+    kpi_query = """
+        SELECT ke.event_type, ke.service_id, ke.service_name, ke.service_price, ke.staff_id, ke.staff_name,
+               ke.duration_minutes, ke.appointment_date, ke.appointment_time, ke.created_at
+        FROM kpi_events ke
+        LEFT JOIN appointments a ON ke.appointment_id = a.id
+        WHERE ke.appointment_date BETWEEN %s AND %s
+    """
+    kpi_params = [start, end]
+    if has_business_filter:
+        kpi_query += f" AND a.business_id IN ({placeholders})"
+        kpi_params.extend(business_ids)
+
     kpis = fetch_df(
         engine,
-        """
-        SELECT event_type, service_id, service_name, service_price, staff_id, staff_name,
-               duration_minutes, appointment_date, appointment_time, created_at
-        FROM kpi_events
-        WHERE appointment_date BETWEEN %s AND %s
-        """,
-        [start, end],
+        kpi_query,
+        kpi_params,
     )
+
+    call_query = "SELECT id, business_id, started_at, ended_at, outcome FROM calls WHERE DATE(started_at) BETWEEN %s AND %s"
+    call_params = [start, end]
+    if has_business_filter:
+        call_query += f" AND business_id IN ({placeholders})"
+        call_params.extend(business_ids)
     calls = fetch_df(
         engine,
-        "SELECT id, started_at, ended_at, outcome FROM calls WHERE DATE(started_at) BETWEEN %s AND %s",
-        [start, end],
+        call_query,
+        call_params,
     )
-    hours = fetch_df(
-        engine,
-        "SELECT day_of_week, open_time, close_time, is_closed FROM business_hours WHERE business_id = 1",
-    )
+
+    if has_business_filter and len(business_ids) == 1:
+        hours = fetch_df(
+            engine,
+            "SELECT day_of_week, open_time, close_time, is_closed FROM business_hours WHERE business_id = %s",
+            [business_ids[0]],
+        )
+    else:
+        hours = fetch_df(
+            engine,
+            "SELECT day_of_week, open_time, close_time, is_closed FROM business_hours WHERE business_id = (SELECT MIN(id) FROM businesses)",
+        )
     return appts, calls, hours, kpis
 
 
@@ -355,6 +395,114 @@ def build_figures(metrics):
     return fig_bookings, fig_revenue, fig_svc, fig_staff, fig_svc_pie, fig_staff_pie
 
 
+def build_kpi_cards(metrics):
+    bookings_delta = ((metrics["bookings_7"] - metrics["bookings_prev"]) / max(metrics["bookings_prev"], 1)) * 100
+    return [
+        {"label": "Bookings (7d)", "value": metrics["bookings_7"], "delta": f"{bookings_delta:.1f}% vs prev 7d"},
+        {"label": "Total Calls (7d)", "value": metrics["total_calls_7"], "delta": ""},
+        {"label": "Booked Calls % (7d)", "value": f"{metrics['booked_calls_pct_7']:.1f}%", "delta": ""},
+        {"label": "Cancellation Rate (30d)", "value": f"{metrics['cancel_rate']:.1f}%", "delta": ""},
+        {"label": "Average Booking Value (30d)", "value": f"${metrics['avg_booking_value_30']:.0f}", "delta": ""},
+        {"label": "Total Appointments (30d)", "value": metrics["total_appointments_30"], "delta": ""},
+        {"label": "Conversion", "value": f"{metrics['conversion']:.1f}%" if metrics["conversion"] is not None else "-", "delta": ""},
+        {"label": "Revenue (30d)", "value": f"${metrics['revenue_30']:.0f}", "delta": ""},
+    ]
+
+
+def _metric_value(metrics, key):
+    return metrics.get(key) if metrics is not None else 0
+
+
+def build_comparison_figures(left_name: str, left_metrics: dict, right_name: str, right_metrics: dict):
+    left_ts = left_metrics.get("ts", pd.DataFrame()).copy()
+    right_ts = right_metrics.get("ts", pd.DataFrame()).copy()
+
+    for ts in (left_ts, right_ts):
+        if ts.empty:
+            continue
+        ts["date"] = pd.to_datetime(ts["date"], errors="coerce")
+        ts["bookings"] = pd.to_numeric(ts["bookings"], errors="coerce").fillna(0)
+        ts["revenue"] = pd.to_numeric(ts["revenue"], errors="coerce").fillna(0)
+
+    cmp_df = pd.DataFrame(columns=["date", "left_bookings", "right_bookings", "left_revenue", "right_revenue"])
+    if not left_ts.empty or not right_ts.empty:
+        cmp_df = pd.merge(
+            left_ts[["date", "bookings", "revenue"]].rename(columns={"bookings": "left_bookings", "revenue": "left_revenue"}),
+            right_ts[["date", "bookings", "revenue"]].rename(columns={"bookings": "right_bookings", "revenue": "right_revenue"}),
+            on="date",
+            how="outer",
+        ).sort_values("date")
+        cmp_df = cmp_df.fillna(0)
+
+    fig_bookings = go.Figure()
+    fig_bookings.add_trace(go.Scatter(
+        x=cmp_df["date"], y=cmp_df["left_bookings"], mode="lines+markers", name=f"{left_name} Bookings"
+    ))
+    fig_bookings.add_trace(go.Scatter(
+        x=cmp_df["date"], y=cmp_df["right_bookings"], mode="lines+markers", name=f"{right_name} Bookings"
+    ))
+    fig_bookings.update_layout(title="Bookings Trend Comparison", margin=dict(t=40))
+
+    fig_revenue = go.Figure()
+    fig_revenue.add_trace(go.Bar(x=cmp_df["date"], y=cmp_df["left_revenue"], name=left_name))
+    fig_revenue.add_trace(go.Bar(x=cmp_df["date"], y=cmp_df["right_revenue"], name=right_name))
+    fig_revenue.update_layout(title="Revenue Comparison", barmode="group", margin=dict(t=40))
+    return fig_bookings, fig_revenue
+
+
+def serve_comparison_layout(left_name: str, left_metrics: dict, right_name: str, right_metrics: dict):
+    comparison_rows = [
+        ("Bookings (7d)", int(_metric_value(left_metrics, "bookings_7")), int(_metric_value(right_metrics, "bookings_7"))),
+        ("Revenue (30d)", float(_metric_value(left_metrics, "revenue_30")), float(_metric_value(right_metrics, "revenue_30"))),
+        ("Conversion %", float(_metric_value(left_metrics, "conversion") or 0), float(_metric_value(right_metrics, "conversion") or 0)),
+        ("Cancel Rate %", float(_metric_value(left_metrics, "cancel_rate")), float(_metric_value(right_metrics, "cancel_rate"))),
+    ]
+    cards = []
+    for label, left_val, right_val in comparison_rows:
+        if label.startswith("Revenue"):
+            left_display = f"${left_val:.0f}"
+            right_display = f"${right_val:.0f}"
+            diff_display = f"${(left_val - right_val):.0f}"
+        elif "%" in label:
+            left_display = f"{left_val:.1f}%"
+            right_display = f"{right_val:.1f}%"
+            diff_display = f"{(left_val - right_val):.1f} pts"
+        else:
+            left_display = f"{int(left_val)}"
+            right_display = f"{int(right_val)}"
+            diff_display = f"{int(left_val - right_val)}"
+        winner = left_name if left_val > right_val else right_name if right_val > left_val else "Tie"
+        cards.append({
+            "label": label,
+            "left": left_display,
+            "right": right_display,
+            "diff": diff_display,
+            "winner": winner,
+        })
+
+    fig_bookings, fig_revenue = build_comparison_figures(left_name, left_metrics, right_name, right_metrics)
+    card_divs = [
+        html.Div([
+            html.Div(card["label"], className="kpi-label"),
+            html.Div(f"{left_name}: {card['left']}", className="kpi-subvalue"),
+            html.Div(f"{right_name}: {card['right']}", className="kpi-subvalue"),
+            html.Div(f"Delta: {card['diff']} • Winner: {card['winner']}", className="kpi-delta"),
+        ], className="card kpi-card") for card in cards
+    ]
+    return html.Div([
+        html.Div([
+            html.Div("Overview", className="section-eyebrow"),
+            html.H2(f"{left_name} vs {right_name}", className="section-title"),
+            html.Div("Comparative performance across bookings, revenue, conversion, and cancellations.", className="section-subtitle"),
+        ], className="section-head"),
+        html.Div(card_divs, className="cards"),
+        html.Div([
+            html.Div(dcc.Graph(figure=fig_bookings, className="graph-card"), className="panel-graph"),
+            html.Div(dcc.Graph(figure=fig_revenue, className="graph-card"), className="panel-graph"),
+        ], className="row"),
+    ], className="dashboard-stack")
+
+
 def _normalize_calendar_appts(appts):
     appts = appts.copy()
     appts["appointment_date"] = pd.to_datetime(appts["appointment_date"], errors="coerce")
@@ -547,18 +695,8 @@ def build_calendar_payload(appts):
     return payload
 
 
-def serve_layout(metrics, figs, start_date=None, end_date=None):
-    bookings_delta = ((metrics["bookings_7"] - metrics["bookings_prev"]) / max(metrics["bookings_prev"], 1)) * 100
-    cards = [
-        {"label": "Bookings (7d)", "value": metrics["bookings_7"], "delta": f"{bookings_delta:.1f}% vs prev 7d"},
-        {"label": "Total Calls (7d)", "value": metrics["total_calls_7"], "delta": ""},
-        {"label": "Booked Calls % (7d)", "value": f"{metrics['booked_calls_pct_7']:.1f}%", "delta": ""},
-        {"label": "Cancellation Rate (30d)", "value": f"{metrics['cancel_rate']:.1f}%", "delta": ""},
-        {"label": "Average Booking Value (30d)", "value": f"${metrics['avg_booking_value_30']:.0f}", "delta": ""},
-        {"label": "Total Appointments (30d)", "value": metrics["total_appointments_30"], "delta": ""},
-        {"label": "Conversion", "value": f"{metrics['conversion']:.1f}%" if metrics["conversion"] is not None else "-", "delta": ""},
-        {"label": "Revenue (30d)", "value": f"${metrics['revenue_30']:.0f}", "delta": ""},
-    ]
+def serve_layout(metrics, figs, headline="Business Dashboard", subtitle="Performance snapshot across bookings, revenue, and staffing."):
+    cards = build_kpi_cards(metrics)
 
     card_divs = [
         html.Div([
@@ -572,8 +710,8 @@ def serve_layout(metrics, figs, start_date=None, end_date=None):
         html.Div([
             html.Div([
                 html.Div("Overview", className="section-eyebrow"),
-                html.H2("Business Dashboard", className="section-title"),
-                html.Div("Performance snapshot across bookings, revenue, and staffing.", className="section-subtitle"),
+                html.H2(headline, className="section-title"),
+                html.Div(subtitle, className="section-subtitle"),
             ], className="section-head"),
             html.Div(card_divs, className="cards"),
         ], className="section-block"),
@@ -592,12 +730,15 @@ def serve_layout(metrics, figs, start_date=None, end_date=None):
     ], className="dashboard-stack")
 
 
-def build_app(metrics, figs):
+def build_app(metrics, figs, businesses, default_primary_id, default_secondary_id=None):
     app = Dash(__name__, external_stylesheets=["https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css"])
     app.title = "Voice Facilitator Dashboard"
 
     today = date.today()
     default_start = today - timedelta(days=89)
+    business_options = [{"label": b["name"], "value": b["id"]} for b in businesses]
+    if default_secondary_id is None:
+        default_secondary_id = default_primary_id
 
     graph_tab = html.Div([
         html.Div([
@@ -608,6 +749,37 @@ def build_app(metrics, figs):
                     start_date=default_start,
                     end_date=today,
                     display_format="YYYY-MM-DD",
+                ),
+            ], className="card"),
+            html.Div([
+                html.Div("View mode", className="pill-label"),
+                dcc.RadioItems(
+                    id="view-mode",
+                    options=[
+                        {"label": "Single Business", "value": "single"},
+                        {"label": "Compare Two", "value": "compare"},
+                    ],
+                    value="single",
+                    className="mode-toggle",
+                    labelStyle={"display": "inline-block", "marginRight": "12px"},
+                ),
+            ], className="card"),
+            html.Div([
+                html.Div("Primary business", className="pill-label"),
+                dcc.Dropdown(
+                    id="business-primary",
+                    options=business_options,
+                    value=default_primary_id,
+                    clearable=False,
+                ),
+            ], className="card"),
+            html.Div([
+                html.Div("Secondary business", className="pill-label"),
+                dcc.Dropdown(
+                    id="business-secondary",
+                    options=business_options,
+                    value=default_secondary_id,
+                    clearable=False,
                 ),
             ], className="card"),
         ], className="cards"),
@@ -647,8 +819,8 @@ def build_app(metrics, figs):
         ], className="section-head"),
         dcc.Store(id="calendar-data", data=calendar_data),
         dcc.Tabs([
-            dcc.Tab(label="Timeline", children=[dcc.Graph(figure=calendar_timeline, className="graph-card")], className="tab", selected_className="tab-selected"),
-            dcc.Tab(label="Month", children=[calendar_month], className="tab", selected_className="tab-selected"),
+            dcc.Tab(label="Timeline", children=[dcc.Graph(id="calendar-timeline", figure=calendar_timeline, className="graph-card")], className="tab", selected_className="tab-selected"),
+            dcc.Tab(label="Month", children=[html.Div(id="calendar-month-view", children=calendar_month)], className="tab", selected_className="tab-selected"),
             dcc.Tab(label="Day", children=[
                 html.Div([
                     html.Div("Select day", className="pill-label"),
@@ -785,8 +957,10 @@ def build_app(metrics, figs):
                     letter-spacing: 0.12em;
                 }
                 .kpi-value { font-size: 26px; font-weight: 700; margin-top: 6px; }
+                .kpi-subvalue { font-size: 14px; font-weight: 600; margin-top: 6px; color: var(--accent-strong); }
                 .kpi-delta { color: #149f76; font-size: 12px; margin-top: 4px; }
                 .shadow { box-shadow: var(--shadow); }
+                .mode-toggle label { font-size: 13px; color: var(--text); }
                 .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-2); }
                 .panel-graph {
                     background: var(--card);
@@ -1052,31 +1226,86 @@ def build_app(metrics, figs):
 def main():
     eng = get_engine()
     agent = AnalyticsAgent()
+    businesses = list_businesses(eng)
+    if not businesses:
+        print("No businesses found. Run database initialization first.")
+        return
+    business_name_map = {b["id"]: b["name"] for b in businesses}
+    default_primary_id = businesses[0]["id"]
+    default_secondary_id = businesses[1]["id"] if len(businesses) > 1 else businesses[0]["id"]
     try:
-        appts, calls, hours, kpis = load_data(eng)
+        appts, calls, hours, kpis = load_data(eng, business_ids=[default_primary_id])
     except OperationalError as e:
         print(f"Database connection failed: {e}")
         print("Check that MySQL is reachable with your DB_* env vars.")
         return
     metrics = compute_metrics(appts, calls, hours, kpis)
     figs = build_figures(metrics)
-    app = build_app(metrics, figs)
+    app = build_app(metrics, figs, businesses, default_primary_id, default_secondary_id)
 
     # Callback: date range refresh
     @app.callback(
         Output("dashboard-panel", "children"),
-        [Input("date-range", "start_date"), Input("date-range", "end_date")]
+        [
+            Input("date-range", "start_date"),
+            Input("date-range", "end_date"),
+            Input("view-mode", "value"),
+            Input("business-primary", "value"),
+            Input("business-secondary", "value"),
+        ],
     )
-    def update_dashboard(start_date, end_date):
+    def update_dashboard(start_date, end_date, view_mode, business_primary, business_secondary):
         try:
             start = pd.to_datetime(start_date).date() if start_date else None
             end = pd.to_datetime(end_date).date() if end_date else None
-            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end)
+            primary_id = int(business_primary or default_primary_id)
+            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[primary_id])
             metrics_f = compute_metrics(appts_f, calls_f, hours_f, kpis_f)
             figs_f = build_figures(metrics_f)
-            return serve_layout(metrics_f, figs_f)
+            primary_name = business_name_map.get(primary_id, f"Business {primary_id}")
+            if view_mode == "compare":
+                secondary_id = int(business_secondary or primary_id)
+                if secondary_id == primary_id:
+                    return html.Div("Choose a different secondary business to compare.", className="card")
+                appts_b, calls_b, hours_b, kpis_b = load_data(eng, start, end, business_ids=[secondary_id])
+                metrics_b = compute_metrics(appts_b, calls_b, hours_b, kpis_b)
+                secondary_name = business_name_map.get(secondary_id, f"Business {secondary_id}")
+                return serve_comparison_layout(primary_name, metrics_f, secondary_name, metrics_b)
+            return serve_layout(
+                metrics_f,
+                figs_f,
+                headline=f"{primary_name} Dashboard",
+                subtitle="Performance snapshot across bookings, revenue, and staffing.",
+            )
         except Exception as e:
             return html.Div(f"Error loading data: {e}")
+
+    @app.callback(
+        [
+            Output("calendar-data", "data"),
+            Output("calendar-timeline", "figure"),
+            Output("calendar-month-view", "children"),
+        ],
+        [
+            Input("date-range", "start_date"),
+            Input("date-range", "end_date"),
+            Input("business-primary", "value"),
+        ],
+    )
+    def update_calendar_context(start_date, end_date, business_primary):
+        try:
+            start = pd.to_datetime(start_date).date() if start_date else None
+            end = pd.to_datetime(end_date).date() if end_date else None
+            primary_id = int(business_primary or default_primary_id)
+            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[primary_id])
+            metrics_f = compute_metrics(appts_f, calls_f, hours_f, kpis_f)
+            timeline, month_view, _ = build_calendar_views(metrics_f)
+            payload = build_calendar_payload(metrics_f["appts"]).to_dict(orient="records")
+            return payload, timeline, month_view
+        except Exception as e:
+            empty_fig = go.Figure()
+            empty_fig.add_annotation(text=f"Error: {e}", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+            return [], empty_fig, html.Div("No appointments available.", className="calendar-empty")
 
     # Callback: calendar day view refresh
     @app.callback(
@@ -1136,12 +1365,17 @@ def main():
     @app.callback(
         [Output("qa-answer", "children"), Output("qa-sql", "children")],
         [Input("qa-submit", "n_clicks")],
-        [State("qa-input", "value")]
+        [State("qa-input", "value"), State("business-primary", "value")]
     )
-    def run_analytics(n_clicks, question):
+    def run_analytics(n_clicks, question, business_primary):
         if not n_clicks or not question:
             return "", ""
-        plan = agent.generate_sql(question)
+        primary_id = int(business_primary or default_primary_id)
+        scoped_question = (
+            f"{question}\n"
+            f"Scope analytics to business_id={primary_id} whenever the referenced table has a business_id column."
+        )
+        plan = agent.generate_sql(scoped_question)
         if plan.get("error"):
             return f"SQL generation error: {plan['error']}", ""
         sql = plan.get("sql", "")

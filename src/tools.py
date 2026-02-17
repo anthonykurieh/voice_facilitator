@@ -22,7 +22,7 @@ class BackendTools:
         """
         self.db = database
         self.config = config
-        self.business_id = 1  # Assuming single business for now
+        self.business_id = int(self.config.get("business.id", 1))
         # Cache config services/staff for fallback
         self._config_services = {s.get("name", "").lower(): s for s in self.config.get_services()}
         self._config_staff = [s for s in self.config.get_staff() if s.get("available", True)]
@@ -290,7 +290,7 @@ class BackendTools:
             return parsed_time
         if self._time_has_meridiem(raw_time_str):
             return parsed_time
-        hours = self.db.get_business_hours_for_date(appointment_date)
+        hours = self.db.get_business_hours_for_date(appointment_date, business_id=self.business_id)
         if not hours or hours.get("is_closed"):
             return parsed_time
         open_time = hours.get("open_time")
@@ -346,7 +346,7 @@ class BackendTools:
         if service_id:
             try:
                 service_id_int = int(service_id)
-                svc = self.db.get_service_by_id(service_id_int)
+                svc = self.db.get_service_by_id(service_id_int, business_id=self.business_id)
                 if svc:
                     return {
                         "service_id": svc["id"],
@@ -360,7 +360,7 @@ class BackendTools:
         # Try by name
         svc = self._get_service_from_config(service_name) if service_name else None
         if not svc and service_name:
-            db_svc = self.db.get_service_by_name(service_name)
+            db_svc = self.db.get_service_by_name(service_name, business_id=self.business_id)
             if db_svc:
                 svc = {
                     "name": db_svc.get("name"),
@@ -372,7 +372,7 @@ class BackendTools:
         if svc and (not svc.get("id")):
             name_for_lookup = service_name or svc.get("name")
             if name_for_lookup:
-                db_svc = self.db.get_service_by_name(name_for_lookup)
+                db_svc = self.db.get_service_by_name(name_for_lookup, business_id=self.business_id)
                 if db_svc:
                     svc = {
                         "name": db_svc.get("name") or svc.get("name"),
@@ -406,7 +406,7 @@ class BackendTools:
         if staff_id:
             try:
                 staff_id_int = int(staff_id)
-                staff = self.db.get_staff_by_id(staff_id_int)
+                staff = self.db.get_staff_by_id(staff_id_int, business_id=self.business_id)
                 if staff:
                     if not staff.get("available", True):
                         return {"error": f"Staff {staff.get('name')} is not available."}
@@ -415,14 +415,14 @@ class BackendTools:
                 pass
 
         if staff_name:
-            db_staff = self.db.get_staff_by_name(staff_name)
+            db_staff = self.db.get_staff_by_name(staff_name, business_id=self.business_id)
             if db_staff:
                 if not db_staff.get("available", True):
                     return {"error": f"Staff {db_staff.get('name')} is not available."}
                 return {"staff_id": db_staff["id"], "staff_name": db_staff.get("name")}
 
         # Fallback to first available staff in config
-        available_staff = self.db.get_available_staff()
+        available_staff = self.db.get_available_staff(business_id=self.business_id)
         if available_staff:
             first_staff = available_staff[0]
             return {"staff_id": first_staff.get("id"), "staff_name": first_staff.get("name")}
@@ -486,7 +486,7 @@ class BackendTools:
         # Check business hours from DB to avoid config/DB drift
         day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
         day_name = day_names[appointment_date.weekday()]
-        hours = self.db.get_business_hours_for_date(appointment_date)
+        hours = self.db.get_business_hours_for_date(appointment_date, business_id=self.business_id)
         is_closed = not hours or hours.get("is_closed")
         if is_closed:
             logger.warning(f"Business is closed on {day_name} ({appointment_date})")
@@ -505,11 +505,12 @@ class BackendTools:
                 appointment_date,
                 staff_id=staff_id,
                 duration_minutes=duration_minutes,
-                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                business_id=self.business_id
             )
         else:
             # Union availability across all available staff
-            staff_list = self.db.get_available_staff()
+            staff_list = self.db.get_available_staff(business_id=self.business_id)
             if staff_list:
                 slot_times = set()
                 for staff in staff_list:
@@ -517,7 +518,8 @@ class BackendTools:
                         appointment_date,
                         staff_id=staff.get("id"),
                         duration_minutes=duration_minutes,
-                        buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                        buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                        business_id=self.business_id
                     )
                     for slot in staff_slots:
                         slot_times.add(slot["time"])
@@ -527,7 +529,8 @@ class BackendTools:
                     appointment_date,
                     staff_id=None,
                     duration_minutes=duration_minutes,
-                    buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                    buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                    business_id=self.business_id
                 )
         
         return {
@@ -611,7 +614,7 @@ class BackendTools:
         # Check business hours from DB to avoid config/DB drift
         day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
         day_name = day_names[appointment_date.weekday()]
-        hours = self.db.get_business_hours_for_date(appointment_date)
+        hours = self.db.get_business_hours_for_date(appointment_date, business_id=self.business_id)
         is_closed = not hours or hours.get("is_closed")
         
         if is_closed:
@@ -644,25 +647,27 @@ class BackendTools:
 
         if staff_specified:
             if staff_id is None and staff_name:
-                db_staff = self.db.get_staff_by_name(staff_name)
+                db_staff = self.db.get_staff_by_name(staff_name, business_id=self.business_id)
                 if db_staff:
                     staff_id = db_staff['id']
             available_slots = self.db.get_available_slots(
                 appointment_date,
                 staff_id=staff_id,
                 duration_minutes=duration_minutes,
-                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                business_id=self.business_id
             )
         else:
             # Auto-assign an available staff member for the requested time
-            staff_list = self.db.get_available_staff()
+            staff_list = self.db.get_available_staff(business_id=self.business_id)
             selected_staff = None
             for staff in staff_list:
                 staff_slots = self.db.get_available_slots(
                     appointment_date,
                     staff_id=staff.get("id"),
                     duration_minutes=duration_minutes,
-                    buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                    buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                    business_id=self.business_id
                 )
                 for slot in staff_slots:
                     if slot["time"].strftime("%H:%M") == requested_time_str:
@@ -682,7 +687,8 @@ class BackendTools:
                         appointment_date,
                         staff_id=staff.get("id"),
                         duration_minutes=duration_minutes,
-                        buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                        buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                        business_id=self.business_id
                     )
                     for slot in staff_slots:
                         slot_times.add(slot["time"].strftime("%H:%M"))
@@ -756,7 +762,8 @@ class BackendTools:
                 appointment_date,
                 staff_id=staff_id,
                 duration_minutes=duration_minutes,
-                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0)
+                buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
+                business_id=self.business_id
             )
             available_times = [slot['time'].strftime("%H:%M") for slot in available_slots[:10]]
             return {
@@ -787,7 +794,8 @@ class BackendTools:
                 appointments = self.db.get_customer_appointments(
                     customer['id'],
                     upcoming_only=True,
-                    today=self._get_today()
+                    today=self._get_today(),
+                    business_id=self.business_id
                 )
                 if appointments:
                     target_id = appointments[0]['id']
@@ -815,7 +823,8 @@ class BackendTools:
         appointments = self.db.get_customer_appointments(
             customer['id'],
             upcoming_only=True,
-            today=self._get_today()
+            today=self._get_today(),
+            business_id=self.business_id
         )
         
         result = {
@@ -891,7 +900,8 @@ class BackendTools:
             appointments = self.db.get_customer_appointments(
                 customer['id'],
                 upcoming_only=True,
-                today=self._get_today()
+                today=self._get_today(),
+                business_id=self.business_id
             )
             if appointments:
                 target_appointment = appointments[0]
@@ -930,13 +940,13 @@ class BackendTools:
             svc = None
             if new_service_id:
                 try:
-                    svc = self.db.get_service_by_id(int(new_service_id))
+                    svc = self.db.get_service_by_id(int(new_service_id), business_id=self.business_id)
                 except (ValueError, TypeError):
                     return {"error": f"Invalid new_service_id: {new_service_id}. Must be a number."}
                 if not svc:
                     return {"error": f"Service not found for id: {new_service_id}."}
             if not svc and new_service_name:
-                svc = self.db.get_service_by_name(new_service_name)
+                svc = self.db.get_service_by_name(new_service_name, business_id=self.business_id)
                 if not svc:
                     svc = self._get_service_from_config(new_service_name)
                 if not svc:
@@ -985,7 +995,8 @@ class BackendTools:
                 staff_id=target_appointment.get('staff_id'),
                 duration_minutes=duration_minutes,
                 buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
-                exclude_appointment_id=target_appointment.get('id')
+                exclude_appointment_id=target_appointment.get('id'),
+                business_id=self.business_id
             )
             logger.info(
                 "reschedule_appointment.availability",
@@ -1020,7 +1031,7 @@ class BackendTools:
         # Check business hours/closure for the new date (DB source of truth)
         day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
         day_name = day_names[new_date.weekday()]
-        hours = self.db.get_business_hours_for_date(new_date)
+        hours = self.db.get_business_hours_for_date(new_date, business_id=self.business_id)
         is_closed = not hours or hours.get("is_closed")
         
         if is_closed:
@@ -1037,7 +1048,8 @@ class BackendTools:
             staff_id=target_appointment.get('staff_id'),
             duration_minutes=duration_minutes,
             buffer_minutes=self.config.get_booking_rules().get("buffer_between_appointments_minutes", 0),
-            exclude_appointment_id=target_appointment.get('id')
+            exclude_appointment_id=target_appointment.get('id'),
+            business_id=self.business_id
         )
         requested_time_str = new_time.strftime("%H:%M")
         time_available = any(slot['time'].strftime("%H:%M") == requested_time_str for slot in available_slots)

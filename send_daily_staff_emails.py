@@ -40,6 +40,16 @@ def _today_in_tz(tz_name: str) -> date:
         return datetime.now().date()
 
 
+def _target_date(tz_name: str) -> date:
+    override = (os.getenv("EMAIL_DATE_OVERRIDE") or "").strip()
+    if override:
+        try:
+            return datetime.strptime(override, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"Invalid EMAIL_DATE_OVERRIDE '{override}'. Expected YYYY-MM-DD. Falling back to today.")
+    return _today_in_tz(tz_name)
+
+
 def _load_staff_emails(config: ConfigLoader) -> dict:
     staff = config.get_staff()
     staff_map = {}
@@ -51,7 +61,7 @@ def _load_staff_emails(config: ConfigLoader) -> dict:
     return staff_map
 
 
-def _fetch_appointments_for_date(db: Database, appt_date: date):
+def _fetch_appointments_for_date(db: Database, appt_date: date, business_id: int):
     with db.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -62,12 +72,32 @@ def _fetch_appointments_for_date(db: Database, appt_date: date):
             LEFT JOIN services s ON a.service_id = s.id
             LEFT JOIN staff st ON a.staff_id = st.id
             LEFT JOIN customers c ON a.customer_id = c.id
-            WHERE a.appointment_date = %s AND a.status = 'scheduled'
+            WHERE a.business_id = %s AND a.appointment_date = %s AND a.status = 'scheduled'
             ORDER BY st.name, a.appointment_time
             """,
-            (appt_date,),
+            (business_id, appt_date),
         )
         return cursor.fetchall()
+
+
+def _resolve_business_id(db: Database, config: ConfigLoader) -> int:
+    config_business_id = config.get("business.id")
+    if config_business_id:
+        try:
+            return int(config_business_id)
+        except (TypeError, ValueError):
+            pass
+    business_name = config.get_business_name()
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM businesses WHERE LOWER(name) = LOWER(%s) LIMIT 1",
+            (business_name,),
+        )
+        row = cursor.fetchone()
+        if row and row.get("id"):
+            return int(row["id"])
+    return 1
 
 
 def _format_time(value) -> str:
@@ -79,41 +109,89 @@ def _format_time(value) -> str:
         return str(value)
 
 
-def _build_email_html(business_name: str, staff_name: str, appt_date: date, rows: list) -> str:
+def _get_email_theme(config: ConfigLoader) -> dict:
+    default_theme = {
+        "palette_name": "Clean Slate",
+        "hero_gradient_start": "#0f172a",
+        "hero_gradient_end": "#1d4ed8",
+        "accent": "#2563eb",
+        "accent_soft": "#dbeafe",
+        "table_header_bg": "#f1f5f9",
+        "table_header_text": "#0f172a",
+        "panel_bg": "#f8fafc",
+        "border": "#e2e8f0",
+    }
+    cfg_theme = config.get("email_theme", {}) or {}
+    if not isinstance(cfg_theme, dict):
+        return default_theme
+    merged = dict(default_theme)
+    for key in default_theme:
+        value = cfg_theme.get(key)
+        if isinstance(value, str) and value.strip():
+            merged[key] = value.strip()
+    return merged
+
+
+def _build_email_html(business_name: str, staff_name: str, appt_date: date, rows: list, theme: dict) -> str:
     date_label = appt_date.strftime("%A, %B %d, %Y")
-    header = f"""
-    <div style="font-family: Arial, sans-serif; color: #111;">
-      <h2 style="margin: 0 0 6px 0;">{business_name} • Daily Schedule</h2>
-      <div style="color:#555; margin-bottom: 16px;">{staff_name} — {date_label}</div>
+    total_count = len(rows)
+    palette_name = theme.get("palette_name", "Signature")
+    hero_gradient_start = theme.get("hero_gradient_start", "#0f172a")
+    hero_gradient_end = theme.get("hero_gradient_end", "#1d4ed8")
+    accent = theme.get("accent", "#2563eb")
+    accent_soft = theme.get("accent_soft", "#dbeafe")
+    table_header_bg = theme.get("table_header_bg", "#f1f5f9")
+    table_header_text = theme.get("table_header_text", "#0f172a")
+    panel_bg = theme.get("panel_bg", "#f8fafc")
+    border = theme.get("border", "#e2e8f0")
+
+    container_open = f"""
+    <div style="font-family: 'Segoe UI', Arial, Helvetica, sans-serif; color: #1f2937; max-width: 760px; margin: 0 auto; padding: 6px;">
+      <div style="background: linear-gradient(135deg, {hero_gradient_start}, {hero_gradient_end}); color: #ffffff; border-radius: 14px; padding: 20px 22px; box-shadow: 0 10px 22px rgba(15, 23, 42, 0.18);">
+        <div style="font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.9;">Daily Staff Schedule • {palette_name}</div>
+        <h2 style="margin: 8px 0 2px 0; font-size: 24px; line-height: 1.2;">{business_name}</h2>
+        <div style="font-size: 15px; opacity: 0.95;">Prepared for <strong>{staff_name}</strong> on {date_label}</div>
+      </div>
+      <div style="margin-top: 12px; background: {panel_bg}; border: 1px solid {border}; border-radius: 10px; padding: 10px 12px; font-size: 14px;">
+        <span style="display:inline-block; background:{accent_soft}; color:#0f172a; border-radius:999px; padding:4px 10px; font-size:12px; margin-right:8px;">{staff_name}</span>
+        <strong>Total appointments today:</strong> <span style="color:{accent};">{total_count}</span>
+      </div>
     """
     if not rows:
-        body = """
-        <div style="padding: 12px 14px; background:#f7f7f7; border-radius: 8px;">
+        body = f"""
+        <div style="margin-top: 12px; padding: 14px 16px; background:{panel_bg}; border:1px solid {border}; border-radius: 10px;">
           No appointments scheduled for today.
         </div>
         """
-        return header + body + "</div>"
+        footer = f"""
+        <div style="margin-top: 16px; font-size: 12px; color: #64748b;">
+          This is an automated schedule summary from Voice Facilitator.
+        </div>
+        """
+        return container_open + body + footer + "</div>"
 
     table_rows = []
     for r in rows:
         table_rows.append(
             f"""
             <tr>
-              <td style="padding:8px 10px; border-bottom:1px solid #eee;">{_format_time(r.get('appointment_time'))}</td>
-              <td style="padding:8px 10px; border-bottom:1px solid #eee;">{r.get('service_name') or 'Service'}</td>
-              <td style="padding:8px 10px; border-bottom:1px solid #eee;">{r.get('customer_name') or 'Customer'}</td>
-              <td style="padding:8px 10px; border-bottom:1px solid #eee;">{r.get('duration_minutes') or 30} min</td>
+              <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb;">{_format_time(r.get('appointment_time'))}</td>
+              <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb;">{r.get('service_name') or 'Service'}</td>
+              <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb;">{r.get('customer_name') or 'Customer'}</td>
+              <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb;">{r.get('customer_phone') or 'N/A'}</td>
+              <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb;">{r.get('duration_minutes') or 30} min</td>
             </tr>
             """
         )
     body = f"""
-    <table style="border-collapse: collapse; width:100%; font-size: 14px;">
+    <table style="margin-top: 12px; border-collapse: separate; border-spacing: 0; width:100%; font-size: 14px; border:1px solid {border}; border-radius: 10px; overflow: hidden;">
       <thead>
-        <tr>
-          <th align="left" style="padding:8px 10px; border-bottom:2px solid #111;">Time</th>
-          <th align="left" style="padding:8px 10px; border-bottom:2px solid #111;">Service</th>
-          <th align="left" style="padding:8px 10px; border-bottom:2px solid #111;">Customer</th>
-          <th align="left" style="padding:8px 10px; border-bottom:2px solid #111;">Duration</th>
+        <tr style="background:{table_header_bg}; color:{table_header_text};">
+          <th align="left" style="padding:10px 12px; border-bottom:1px solid {border};">Time</th>
+          <th align="left" style="padding:10px 12px; border-bottom:1px solid {border};">Service</th>
+          <th align="left" style="padding:10px 12px; border-bottom:1px solid {border};">Customer</th>
+          <th align="left" style="padding:10px 12px; border-bottom:1px solid {border};">Phone</th>
+          <th align="left" style="padding:10px 12px; border-bottom:1px solid {border};">Duration</th>
         </tr>
       </thead>
       <tbody>
@@ -121,7 +199,12 @@ def _build_email_html(business_name: str, staff_name: str, appt_date: date, rows
       </tbody>
     </table>
     """
-    return header + body + "</div>"
+    footer = """
+    <div style="margin-top: 16px; font-size: 12px; color: #64748b;">
+      This is an automated schedule summary from Voice Facilitator.
+    </div>
+    """
+    return container_open + body + footer + "</div>"
 
 
 def _send_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_password: str,
@@ -158,15 +241,17 @@ def main():
     db = Database()
 
     tz_name = _get_timezone(config)
-    today = _today_in_tz(tz_name)
+    target_date = _target_date(tz_name)
     business_name = config.get_business_name()
+    business_id = _resolve_business_id(db, config)
+    theme = _get_email_theme(config)
     staff_emails = _load_staff_emails(config)
 
     if not staff_emails:
         print("No staff emails found in config.")
         return
 
-    appointments = _fetch_appointments_for_date(db, today)
+    appointments = _fetch_appointments_for_date(db, target_date, business_id)
     staff_groups = {}
     for row in appointments:
         staff_name = row.get("staff_name") or "Unassigned"
@@ -174,10 +259,10 @@ def main():
 
     for staff_name, email in staff_emails.items():
         rows = staff_groups.get(staff_name, [])
-        subject = f"{business_name} schedule for {today.strftime('%b %d, %Y')}"
-        html_body = _build_email_html(business_name, staff_name, today, rows)
+        subject = f"{business_name} • {staff_name} • schedule for {target_date.strftime('%b %d, %Y')}"
+        html_body = _build_email_html(business_name, staff_name, target_date, rows, theme)
         if dry_run:
-            print(f"[DRY_RUN] Would send to {email}: {len(rows)} appointments")
+            print(f"[DRY_RUN] {business_name} | {staff_name} -> {email}: {len(rows)} appointments ({target_date.isoformat()})")
             continue
         _send_email(
             smtp_host=smtp_host,
@@ -190,7 +275,7 @@ def main():
             html_body=html_body,
             use_tls=use_tls,
         )
-        print(f"Sent to {email}: {len(rows)} appointments")
+        print(f"Sent {business_name} | {staff_name} -> {email}: {len(rows)} appointments ({target_date.isoformat()})")
 
 
 if __name__ == "__main__":

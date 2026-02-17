@@ -254,7 +254,7 @@ class Database:
             """, (transcript, call_id))
             conn.commit()
     
-    def get_business_hours_for_date(self, day: date) -> Optional[Dict[str, Any]]:
+    def get_business_hours_for_date(self, day: date, business_id: int = 1) -> Optional[Dict[str, Any]]:
         """Return business hours for a given date (from DB)."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -262,8 +262,8 @@ class Database:
             cursor.execute("""
                 SELECT open_time, close_time, is_closed
                 FROM business_hours
-                WHERE business_id = 1 AND day_of_week = %s
-            """, (day_of_week,))
+                WHERE business_id = %s AND day_of_week = %s
+            """, (business_id, day_of_week))
             hours = cursor.fetchone()
             if not hours:
                 return None
@@ -292,7 +292,8 @@ class Database:
     def get_available_slots(self, date: date, staff_id: Optional[int] = None,
                            duration_minutes: int = 30,
                            buffer_minutes: int = 0,
-                           exclude_appointment_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                           exclude_appointment_id: Optional[int] = None,
+                           business_id: int = 1) -> List[Dict[str, Any]]:
         """Get available time slots for a given date.
         
         Args:
@@ -308,7 +309,7 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            hours = self.get_business_hours_for_date(date)
+            hours = self.get_business_hours_for_date(date, business_id=business_id)
             if not hours or hours.get("is_closed"):
                 logger.warning(f"Business is closed on {date}")
                 return []  # Return empty list - caller should check if business is closed
@@ -321,9 +322,9 @@ class Database:
             query = """
                 SELECT appointment_time, duration_minutes
                 FROM appointments
-                WHERE appointment_date = %s AND status = 'scheduled'
+                WHERE business_id = %s AND appointment_date = %s AND status = 'scheduled'
             """
-            params = [date]
+            params = [business_id, date]
             
             if staff_id:
                 query += " AND staff_id = %s"
@@ -524,7 +525,8 @@ class Database:
     
     def get_customer_appointments(self, customer_id: int,
                                   upcoming_only: bool = True,
-                                  today: Optional[date] = None) -> List[Dict[str, Any]]:
+                                  today: Optional[date] = None,
+                                  business_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get appointments for a customer."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -535,17 +537,18 @@ class Database:
                 LEFT JOIN staff st ON a.staff_id = st.id
                 WHERE a.customer_id = %s
             """
+            params: List[Any] = [customer_id]
+            if business_id is not None:
+                query += " AND a.business_id = %s"
+                params.append(business_id)
             if upcoming_only:
                 if today:
                     query += " AND a.appointment_date >= %s AND a.status = 'scheduled'"
+                    params.append(today)
                 else:
                     query += " AND a.appointment_date >= CURDATE() AND a.status = 'scheduled'"
             query += " ORDER BY a.appointment_date, a.appointment_time"
-
-            if upcoming_only and today:
-                cursor.execute(query, (customer_id, today))
-            else:
-                cursor.execute(query, (customer_id,))
+            cursor.execute(query, tuple(params))
             return cursor.fetchall()
     
     def cancel_appointment(self, appointment_id: int) -> bool:
@@ -582,64 +585,89 @@ class Database:
                 )
             return success
 
-    def get_service_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_service_by_name(self, name: str, business_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Fetch a service by name (case-insensitive)."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            query = """
                 SELECT id, name, duration_minutes, price 
                 FROM services 
                 WHERE LOWER(name) = LOWER(%s) AND active = TRUE
-                LIMIT 1
-            """, (name,))
+            """
+            params: List[Any] = [name]
+            if business_id is not None:
+                query += " AND business_id = %s"
+                params.append(business_id)
+            query += " LIMIT 1"
+            cursor.execute(query, tuple(params))
             return cursor.fetchone()
 
-    def get_service_by_id(self, service_id: int) -> Optional[Dict[str, Any]]:
+    def get_service_by_id(self, service_id: int, business_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Fetch a service by id."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            query = """
                 SELECT id, name, duration_minutes, price
                 FROM services
                 WHERE id = %s
-                LIMIT 1
-            """, (service_id,))
+            """
+            params: List[Any] = [service_id]
+            if business_id is not None:
+                query += " AND business_id = %s"
+                params.append(business_id)
+            query += " LIMIT 1"
+            cursor.execute(query, tuple(params))
             return cursor.fetchone()
 
-    def get_staff_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_staff_by_name(self, name: str, business_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Fetch a staff member by name (case-insensitive)."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            query = """
                 SELECT id, name, available 
                 FROM staff 
                 WHERE LOWER(name) = LOWER(%s)
-                LIMIT 1
-            """, (name,))
+            """
+            params: List[Any] = [name]
+            if business_id is not None:
+                query += " AND business_id = %s"
+                params.append(business_id)
+            query += " LIMIT 1"
+            cursor.execute(query, tuple(params))
             return cursor.fetchone()
 
-    def get_staff_by_id(self, staff_id: int) -> Optional[Dict[str, Any]]:
+    def get_staff_by_id(self, staff_id: int, business_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Fetch a staff member by id."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            query = """
                 SELECT id, name, available
                 FROM staff
                 WHERE id = %s
-                LIMIT 1
-            """, (staff_id,))
+            """
+            params: List[Any] = [staff_id]
+            if business_id is not None:
+                query += " AND business_id = %s"
+                params.append(business_id)
+            query += " LIMIT 1"
+            cursor.execute(query, tuple(params))
             return cursor.fetchone()
 
-    def get_available_staff(self) -> List[Dict[str, Any]]:
+    def get_available_staff(self, business_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return available staff ordered by id."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            query = """
                 SELECT id, name, available
                 FROM staff
                 WHERE available = TRUE
-                ORDER BY id ASC
-            """)
+            """
+            params: List[Any] = []
+            if business_id is not None:
+                query += " AND business_id = %s"
+                params.append(business_id)
+            query += " ORDER BY id ASC"
+            cursor.execute(query, tuple(params))
             return cursor.fetchall()
 
     def get_appointment_by_id(self, appointment_id: int) -> Optional[Dict[str, Any]]:

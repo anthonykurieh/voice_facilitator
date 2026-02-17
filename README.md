@@ -30,6 +30,9 @@ This loop repeats until the call ends.
 - Checks availability and suggests alternatives
 - Remembers context across turns
 - No infinite clarification loops
+- Multi-business config support (switch profiles via GUI)
+- Visual Business Config Builder (HTML form → YAML file)
+- Staff daily email summaries with per-business theme colors
 
 ## Setup
 
@@ -116,6 +119,44 @@ All business-specific information is in `config/business_config.yaml`:
 - **booking**: Booking rules (advance notice, buffers, etc.)
 
 To switch businesses, simply change the config file and restart.
+
+### Business Config Builder (GUI + HTML)
+
+- Open `python demo_launcher.py`
+- Go to **Admin Mode** → **Business Config Builder**
+- A local page opens at `http://127.0.0.1:8765`
+- Fill the form and click **Create Config File**
+- New files are created under `config/` as `business_config_<name>.yaml`
+- The launcher auto-detects new config files
+
+### Daily Staff Emails
+
+Set SMTP values in `.env`:
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_sender@gmail.com
+SMTP_PASSWORD=your_app_password
+SMTP_FROM=your_sender@gmail.com
+SMTP_TLS=true
+```
+
+Send from GUI:
+- **Admin Mode** → **Send Daily Staff Emails**
+- The button runs a built-in dry-run preview first, then asks for confirmation before real send.
+
+Optional manual run:
+
+```bash
+CONFIG_FILE=config/business_config_riverstone.yaml python send_daily_staff_emails.py
+```
+
+Optional date override for preview/testing:
+
+```bash
+EMAIL_DATE_OVERRIDE=2026-02-18 CONFIG_FILE=config/business_config_riverstone.yaml python send_daily_staff_emails.py
+```
 
 ## Usage
 
@@ -248,5 +289,4 @@ MIT License - feel free to use and modify for your business.
 - This is a voice-first system, not optimized for text chat
 - Requires stable internet connection for OpenAI API calls
 - MySQL database must be accessible
-- Designed for single business per instance (can be extended for multi-tenant)
-
+- Supports multiple business profiles in one database (scoped by `business_id`)

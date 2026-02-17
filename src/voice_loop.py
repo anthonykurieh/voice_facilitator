@@ -49,13 +49,17 @@ class VoiceLoop:
         self.call_outcome = None
         self.call_customer_id = None
         self.call_appointment_id = None
+        self.business_id = int(self.config.get("business.id", 1))
         
         # Initialize database schema
         logger.info("Initializing database...")
         print("Initializing database...")
         self.database.initialize_schema()
         try:
-            init_business_data()
+            initialized_business_id = init_business_data()
+            if initialized_business_id:
+                self.business_id = int(initialized_business_id)
+                self.tools.business_id = self.business_id
         except Exception as e:
             logger.warning(f"Business data initialization skipped: {e}")
         
@@ -72,7 +76,7 @@ class VoiceLoop:
 
         # Start call record
         try:
-            self.call_id = self.database.create_call(business_id=1)
+            self.call_id = self.database.create_call(business_id=self.business_id)
             logger.info(f"Call started with id {self.call_id}")
         except Exception as e:
             logger.warning(f"Could not create call record: {e}")
