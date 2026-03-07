@@ -9,8 +9,10 @@ The app will listen on http://127.0.0.1:8050 by default.
 import calendar as cal
 import json
 import os
+from glob import glob
+from pathlib import Path
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import Dict, Optional
 
 # Stub bottleneck if compiled wheel conflicts with NumPy >=2
 import types
@@ -31,12 +33,152 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import Engine
 from src.analytics_agent import AnalyticsAgent
+import yaml
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+
+DEFAULT_DASHBOARD_THEME = {
+    "bg": "#f4f2ef",
+    "panel": "rgba(255, 255, 255, 0.92)",
+    "card": "rgba(255, 255, 255, 0.96)",
+    "accent": "#0f6fff",
+    "accent_strong": "#0b1b3a",
+    "accent2": "#1bb98a",
+    "text": "#111827",
+    "muted": "#6b7280",
+    "border": "rgba(15, 23, 42, 0.08)",
+    "surface": "#ffffff",
+    "surface_alt": "#f3f5fb",
+}
+
+
+def _normalize_color(value: Optional[str], fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    value = value.strip()
+    if not value:
+        return fallback
+    return value
+
+
+def _hex_to_rgb_csv(color: str, fallback: str) -> str:
+    value = (color or "").strip().lstrip("#")
+    if len(value) != 6:
+        return fallback
+    try:
+        rgb = tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+        return f"{rgb[0]}, {rgb[1]}, {rgb[2]}"
+    except ValueError:
+        return fallback
+
+
+def load_business_themes(config_dir: str = "config") -> Dict[str, dict]:
+    themes: Dict[str, dict] = {}
+    pattern = str(Path(config_dir) / "business_config*.yaml")
+    for path in sorted(glob(pattern)):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        business_name = str((cfg.get("business") or {}).get("name") or "").strip()
+        if not business_name:
+            continue
+        email_theme = cfg.get("email_theme") or {}
+        panel_bg = _normalize_color(email_theme.get("panel_bg"), DEFAULT_DASHBOARD_THEME["panel"])
+        accent = _normalize_color(email_theme.get("accent"), DEFAULT_DASHBOARD_THEME["accent"])
+        accent2 = _normalize_color(email_theme.get("hero_gradient_end"), DEFAULT_DASHBOARD_THEME["accent2"])
+        themes[business_name.lower()] = {
+            "bg": panel_bg,
+            "panel": panel_bg,
+            "card": _normalize_color(email_theme.get("accent_soft"), DEFAULT_DASHBOARD_THEME["card"]),
+            "accent": accent,
+            "accent2": accent2,
+            "accent_strong": _normalize_color(email_theme.get("table_header_text"), DEFAULT_DASHBOARD_THEME["accent_strong"]),
+            "text": _normalize_color(email_theme.get("table_header_text"), DEFAULT_DASHBOARD_THEME["text"]),
+            "muted": DEFAULT_DASHBOARD_THEME["muted"],
+            "border": _normalize_color(email_theme.get("border"), DEFAULT_DASHBOARD_THEME["border"]),
+            "surface": "#ffffff",
+            "surface_alt": _normalize_color(email_theme.get("table_header_bg"), DEFAULT_DASHBOARD_THEME["surface_alt"]),
+        }
+    return themes
+
+
+def build_dashboard_theme_style(
+    primary_business_id: Optional[int],
+    business_name_map: Dict[int, str],
+    business_theme_map: Dict[str, dict],
+) -> dict:
+    theme = DEFAULT_DASHBOARD_THEME.copy()
+    business_name = business_name_map.get(int(primary_business_id)) if primary_business_id else None
+    if business_name:
+        themed = business_theme_map.get(business_name.lower())
+        if themed:
+            theme.update(themed)
+
+    accent_rgb = _hex_to_rgb_csv(theme["accent"], "15, 111, 255")
+    accent2_rgb = _hex_to_rgb_csv(theme["accent2"], "27, 185, 138")
+    return {
+        "--bg": theme["bg"],
+        "--panel": theme["panel"],
+        "--card": theme["card"],
+        "--accent": theme["accent"],
+        "--accent-strong": theme["accent_strong"],
+        "--accent2": theme["accent2"],
+        "--text": theme["text"],
+        "--muted": theme["muted"],
+        "--border": theme["border"],
+        "--surface": theme["surface"],
+        "--surface-alt": theme["surface_alt"],
+        "--accent-rgb": accent_rgb,
+        "--accent2-rgb": accent2_rgb,
+    }
+
+
+def resolve_business_from_config(businesses: list, config_file: Optional[str]):
+    if not config_file:
+        return None
+    cfg_path = Path(config_file)
+    if not cfg_path.is_absolute():
+        cfg_path = Path.cwd() / cfg_path
+    if not cfg_path.exists():
+        return None
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+
+    business = cfg.get("business", {}) if isinstance(cfg, dict) else {}
+    target_id = business.get("id")
+    target_name = str(business.get("name") or "").strip().lower()
+
+    for b in businesses:
+        if target_id is not None and int(b["id"]) == int(target_id):
+            return int(b["id"])
+    for b in businesses:
+        if target_name and str(b["name"]).strip().lower() == target_name:
+            return int(b["id"])
+    return None
+
+
+def resolve_dashboard_theme(
+    primary_business_id: Optional[int],
+    business_name_map: Dict[int, str],
+    business_theme_map: Dict[str, dict],
+) -> dict:
+    theme = DEFAULT_DASHBOARD_THEME.copy()
+    business_name = business_name_map.get(int(primary_business_id)) if primary_business_id else None
+    if business_name:
+        themed = business_theme_map.get(business_name.lower())
+        if themed:
+            theme.update(themed)
+    return theme
 
 
 def get_engine() -> Engine:
@@ -360,37 +502,64 @@ def format_metric(value, suffix=""):
     return f"{value:.1f}{suffix}" if isinstance(value, float) else str(value)
 
 
-def build_figures(metrics):
+def _style_figure(fig, theme):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": theme["text"]},
+        legend={"font": {"color": theme["text"]}},
+        margin=dict(t=40, l=30, r=20, b=30),
+    )
+    fig.update_xaxes(gridcolor=theme["border"], zerolinecolor=theme["border"])
+    fig.update_yaxes(gridcolor=theme["border"], zerolinecolor=theme["border"])
+    return fig
+
+
+def build_figures(metrics, theme=None):
+    theme = theme or DEFAULT_DASHBOARD_THEME
     ts = metrics["ts"]
     fig_bookings = go.Figure()
-    fig_bookings.add_trace(go.Scatter(x=ts["date"], y=ts["bookings"], mode="lines+markers", name="Bookings"))
-    fig_bookings.add_trace(go.Scatter(x=ts["date"], y=ts["bookings_ma7"], mode="lines", name="7d MA"))
-    fig_bookings.update_layout(title="Daily Bookings", margin=dict(t=40))
+    fig_bookings.add_trace(go.Scatter(
+        x=ts["date"], y=ts["bookings"], mode="lines+markers", name="Bookings",
+        line={"color": theme["accent"], "width": 3}
+    ))
+    fig_bookings.add_trace(go.Scatter(
+        x=ts["date"], y=ts["bookings_ma7"], mode="lines", name="7d MA",
+        line={"color": theme["accent2"], "dash": "dash", "width": 2}
+    ))
+    fig_bookings.update_layout(title="Daily Bookings")
+    _style_figure(fig_bookings, theme)
 
     fig_revenue = go.Figure()
-    fig_revenue.add_trace(go.Bar(x=ts["date"], y=ts["revenue"], name="Revenue"))
-    fig_revenue.update_layout(title="Revenue", margin=dict(t=40))
+    fig_revenue.add_trace(go.Bar(x=ts["date"], y=ts["revenue"], name="Revenue", marker_color=theme["accent"]))
+    fig_revenue.update_layout(title="Revenue")
+    _style_figure(fig_revenue, theme)
 
     svc = metrics["svc"]
     fig_svc = go.Figure()
-    fig_svc.add_trace(go.Bar(x=svc["service_name"], y=svc["count"], hovertext=svc["revenue"], name="Count"))
+    fig_svc.add_trace(go.Bar(x=svc["service_name"], y=svc["count"], hovertext=svc["revenue"], name="Count", marker_color=theme["accent2"]))
     fig_svc.update_layout(title="Service Mix (count)", xaxis_title="Service", yaxis_title="Bookings")
+    _style_figure(fig_svc, theme)
 
     staff = metrics["staff"]
     fig_staff = go.Figure()
-    fig_staff.add_trace(go.Bar(x=staff["staff_name"], y=staff["duration"], hovertext=staff["revenue"], name="Minutes"))
+    fig_staff.add_trace(go.Bar(x=staff["staff_name"], y=staff["duration"], hovertext=staff["revenue"], name="Minutes", marker_color=theme["accent"]))
     fig_staff.update_layout(title="Staff Load (minutes)", xaxis_title="Staff", yaxis_title="Minutes")
+    _style_figure(fig_staff, theme)
 
     # Pie charts
     svc_pie = metrics["svc_pie"]
     svc_value_field = metrics["svc_pie_value"]
-    fig_svc_pie = go.Figure(go.Pie(labels=svc_pie["service_name"], values=svc_pie[svc_value_field], hole=0.35))
+    pie_colors = [theme["accent"], theme["accent2"], theme["accent_strong"], theme["muted"], theme["surface_alt"]]
+    fig_svc_pie = go.Figure(go.Pie(labels=svc_pie["service_name"], values=svc_pie[svc_value_field], hole=0.35, marker={"colors": pie_colors}))
     fig_svc_pie.update_layout(title=f"Service Mix ({svc_value_field})")
+    _style_figure(fig_svc_pie, theme)
 
     staff_pie = metrics["staff_pie"]
     staff_value_field = metrics["staff_pie_value"]
-    fig_staff_pie = go.Figure(go.Pie(labels=staff_pie["staff_name"], values=staff_pie[staff_value_field], hole=0.35))
+    fig_staff_pie = go.Figure(go.Pie(labels=staff_pie["staff_name"], values=staff_pie[staff_value_field], hole=0.35, marker={"colors": pie_colors}))
     fig_staff_pie.update_layout(title=f"Staff Share ({staff_value_field})")
+    _style_figure(fig_staff_pie, theme)
 
     return fig_bookings, fig_revenue, fig_svc, fig_staff, fig_svc_pie, fig_staff_pie
 
@@ -407,100 +576,6 @@ def build_kpi_cards(metrics):
         {"label": "Conversion", "value": f"{metrics['conversion']:.1f}%" if metrics["conversion"] is not None else "-", "delta": ""},
         {"label": "Revenue (30d)", "value": f"${metrics['revenue_30']:.0f}", "delta": ""},
     ]
-
-
-def _metric_value(metrics, key):
-    return metrics.get(key) if metrics is not None else 0
-
-
-def build_comparison_figures(left_name: str, left_metrics: dict, right_name: str, right_metrics: dict):
-    left_ts = left_metrics.get("ts", pd.DataFrame()).copy()
-    right_ts = right_metrics.get("ts", pd.DataFrame()).copy()
-
-    for ts in (left_ts, right_ts):
-        if ts.empty:
-            continue
-        ts["date"] = pd.to_datetime(ts["date"], errors="coerce")
-        ts["bookings"] = pd.to_numeric(ts["bookings"], errors="coerce").fillna(0)
-        ts["revenue"] = pd.to_numeric(ts["revenue"], errors="coerce").fillna(0)
-
-    cmp_df = pd.DataFrame(columns=["date", "left_bookings", "right_bookings", "left_revenue", "right_revenue"])
-    if not left_ts.empty or not right_ts.empty:
-        cmp_df = pd.merge(
-            left_ts[["date", "bookings", "revenue"]].rename(columns={"bookings": "left_bookings", "revenue": "left_revenue"}),
-            right_ts[["date", "bookings", "revenue"]].rename(columns={"bookings": "right_bookings", "revenue": "right_revenue"}),
-            on="date",
-            how="outer",
-        ).sort_values("date")
-        cmp_df = cmp_df.fillna(0)
-
-    fig_bookings = go.Figure()
-    fig_bookings.add_trace(go.Scatter(
-        x=cmp_df["date"], y=cmp_df["left_bookings"], mode="lines+markers", name=f"{left_name} Bookings"
-    ))
-    fig_bookings.add_trace(go.Scatter(
-        x=cmp_df["date"], y=cmp_df["right_bookings"], mode="lines+markers", name=f"{right_name} Bookings"
-    ))
-    fig_bookings.update_layout(title="Bookings Trend Comparison", margin=dict(t=40))
-
-    fig_revenue = go.Figure()
-    fig_revenue.add_trace(go.Bar(x=cmp_df["date"], y=cmp_df["left_revenue"], name=left_name))
-    fig_revenue.add_trace(go.Bar(x=cmp_df["date"], y=cmp_df["right_revenue"], name=right_name))
-    fig_revenue.update_layout(title="Revenue Comparison", barmode="group", margin=dict(t=40))
-    return fig_bookings, fig_revenue
-
-
-def serve_comparison_layout(left_name: str, left_metrics: dict, right_name: str, right_metrics: dict):
-    comparison_rows = [
-        ("Bookings (7d)", int(_metric_value(left_metrics, "bookings_7")), int(_metric_value(right_metrics, "bookings_7"))),
-        ("Revenue (30d)", float(_metric_value(left_metrics, "revenue_30")), float(_metric_value(right_metrics, "revenue_30"))),
-        ("Conversion %", float(_metric_value(left_metrics, "conversion") or 0), float(_metric_value(right_metrics, "conversion") or 0)),
-        ("Cancel Rate %", float(_metric_value(left_metrics, "cancel_rate")), float(_metric_value(right_metrics, "cancel_rate"))),
-    ]
-    cards = []
-    for label, left_val, right_val in comparison_rows:
-        if label.startswith("Revenue"):
-            left_display = f"${left_val:.0f}"
-            right_display = f"${right_val:.0f}"
-            diff_display = f"${(left_val - right_val):.0f}"
-        elif "%" in label:
-            left_display = f"{left_val:.1f}%"
-            right_display = f"{right_val:.1f}%"
-            diff_display = f"{(left_val - right_val):.1f} pts"
-        else:
-            left_display = f"{int(left_val)}"
-            right_display = f"{int(right_val)}"
-            diff_display = f"{int(left_val - right_val)}"
-        winner = left_name if left_val > right_val else right_name if right_val > left_val else "Tie"
-        cards.append({
-            "label": label,
-            "left": left_display,
-            "right": right_display,
-            "diff": diff_display,
-            "winner": winner,
-        })
-
-    fig_bookings, fig_revenue = build_comparison_figures(left_name, left_metrics, right_name, right_metrics)
-    card_divs = [
-        html.Div([
-            html.Div(card["label"], className="kpi-label"),
-            html.Div(f"{left_name}: {card['left']}", className="kpi-subvalue"),
-            html.Div(f"{right_name}: {card['right']}", className="kpi-subvalue"),
-            html.Div(f"Delta: {card['diff']} • Winner: {card['winner']}", className="kpi-delta"),
-        ], className="card kpi-card") for card in cards
-    ]
-    return html.Div([
-        html.Div([
-            html.Div("Overview", className="section-eyebrow"),
-            html.H2(f"{left_name} vs {right_name}", className="section-title"),
-            html.Div("Comparative performance across bookings, revenue, conversion, and cancellations.", className="section-subtitle"),
-        ], className="section-head"),
-        html.Div(card_divs, className="cards"),
-        html.Div([
-            html.Div(dcc.Graph(figure=fig_bookings, className="graph-card"), className="panel-graph"),
-            html.Div(dcc.Graph(figure=fig_revenue, className="graph-card"), className="panel-graph"),
-        ], className="row"),
-    ], className="dashboard-stack")
 
 
 def _normalize_calendar_appts(appts):
@@ -580,7 +655,7 @@ def build_month_view(appts):
             chips = [
                 html.Button(
                     evt["label"],
-                    id={"type": "cal-event", "index": evt["event_id"]},
+                    id={"type": "cal-event-month", "index": evt["event_id"]},
                     n_clicks=0,
                     className="cal-chip-btn",
                 )
@@ -632,16 +707,18 @@ def build_day_view(appts, selected_date=None, selected_time=None):
                 html.Div(row["service_name"], className="day-title"),
                 html.Div(f"{row['staff_name']} • {row['status']}", className="day-subtitle"),
             ], className="day-details"),
-        ], id={"type": "cal-event", "index": row["event_id"]}, n_clicks=0, className="day-item-btn"))
+        ], id={"type": "cal-event-day", "index": row["event_id"]}, n_clicks=0, className="day-item-btn"))
     return html.Div(items, className="day-list")
 
 
-def build_calendar_views(metrics):
+def build_calendar_views(metrics, theme=None):
+    theme = theme or DEFAULT_DASHBOARD_THEME
     appts = metrics["appts"].copy()
     if appts.empty:
         empty_fig = go.Figure()
         empty_fig.add_annotation(text="No appointments in range", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
-        empty_fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+        empty_fig.update_layout(title="Appointments Timeline")
+        _style_figure(empty_fig, theme)
         month_view = html.Div("No appointments available.", className="calendar-empty")
         day_view = html.Div("No appointments available.", className="calendar-empty")
         return empty_fig, month_view, day_view
@@ -658,7 +735,8 @@ def build_calendar_views(metrics):
     if timeline_df.empty:
         fig = go.Figure()
         fig.add_annotation(text="No scheduled or completed appointments.", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
-        fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+        fig.update_layout(title="Appointments Timeline")
+        _style_figure(fig, theme)
     else:
         fig = px.timeline(
             timeline_df,
@@ -667,9 +745,16 @@ def build_calendar_views(metrics):
             y="staff_name",
             color="status",
             hover_data=["service_name"],
+            color_discrete_map={
+                "scheduled": theme["accent"],
+                "completed": theme["accent2"],
+                "cancelled": theme["muted"],
+                "no_show": theme["accent_strong"],
+            },
         )
         fig.update_yaxes(autorange="reversed")
-        fig.update_layout(title="Appointments Timeline", margin=dict(t=40))
+        fig.update_layout(title="Appointments Timeline")
+        _style_figure(fig, theme)
 
     month_view = build_month_view(appts)
     day_view = build_day_view(appts, date.today())
@@ -730,15 +815,12 @@ def serve_layout(metrics, figs, headline="Business Dashboard", subtitle="Perform
     ], className="dashboard-stack")
 
 
-def build_app(metrics, figs, businesses, default_primary_id, default_secondary_id=None):
+def build_app(metrics, figs, active_business_name, initial_theme=None):
     app = Dash(__name__, external_stylesheets=["https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css"])
     app.title = "Voice Facilitator Dashboard"
 
     today = date.today()
     default_start = today - timedelta(days=89)
-    business_options = [{"label": b["name"], "value": b["id"]} for b in businesses]
-    if default_secondary_id is None:
-        default_secondary_id = default_primary_id
 
     graph_tab = html.Div([
         html.Div([
@@ -752,37 +834,10 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 ),
             ], className="card"),
             html.Div([
-                html.Div("View mode", className="pill-label"),
-                dcc.RadioItems(
-                    id="view-mode",
-                    options=[
-                        {"label": "Single Business", "value": "single"},
-                        {"label": "Compare Two", "value": "compare"},
-                    ],
-                    value="single",
-                    className="mode-toggle",
-                    labelStyle={"display": "inline-block", "marginRight": "12px"},
-                ),
+                html.Div("Business", className="pill-label"),
+                html.Div(active_business_name, className="hero-meta"),
             ], className="card"),
-            html.Div([
-                html.Div("Primary business", className="pill-label"),
-                dcc.Dropdown(
-                    id="business-primary",
-                    options=business_options,
-                    value=default_primary_id,
-                    clearable=False,
-                ),
-            ], className="card"),
-            html.Div([
-                html.Div("Secondary business", className="pill-label"),
-                dcc.Dropdown(
-                    id="business-secondary",
-                    options=business_options,
-                    value=default_secondary_id,
-                    clearable=False,
-                ),
-            ], className="card"),
-        ], className="cards"),
+        ], className="controls-grid"),
         html.Div(id="dashboard-panel", children=serve_layout(metrics, figs), className="stack")
     ], className="tab-content")
     qa_tab = html.Div([
@@ -808,7 +863,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
         ], className="card shadow")
     ], className="panel stack tab-content")
 
-    calendar_timeline, calendar_month, calendar_day = build_calendar_views(metrics)
+    calendar_timeline, calendar_month, calendar_day = build_calendar_views(metrics, theme=initial_theme)
     calendar_payload = build_calendar_payload(metrics["appts"])
     calendar_data = calendar_payload.to_dict(orient="records")
     time_options = build_time_options()
@@ -850,7 +905,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
             dcc.Tab(label="Calendar", children=[calendar_tab], className="tab", selected_className="tab-selected"),
             dcc.Tab(label="Conversational Analytics", children=[qa_tab], className="tab", selected_className="tab-selected"),
         ], className="tabs")
-    ], className="page")
+    ], className="page", id="page-root")
 
     app.index_string = """
     <!DOCTYPE html>
@@ -869,10 +924,14 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     --accent: #0f6fff;
                     --accent-strong: #0b1b3a;
                     --accent2: #1bb98a;
+                    --accent-rgb: 15, 111, 255;
+                    --accent2-rgb: 27, 185, 138;
                     --text: #111827;
                     --muted: #6b7280;
                     --shadow: 0 20px 45px rgba(15, 23, 42, 0.12);
                     --border: rgba(15, 23, 42, 0.08);
+                    --surface: #ffffff;
+                    --surface-alt: #f3f5fb;
                     --glow: 0 0 0 1px rgba(15, 23, 42, 0.04), 0 8px 22px rgba(15, 23, 42, 0.06);
                     --space-1: 8px;
                     --space-2: 14px;
@@ -882,15 +941,15 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 * { box-sizing: border-box; }
                 body {
                     background:
-                        radial-gradient(circle at 15% 20%, rgba(15, 111, 255, 0.12), transparent 35%),
-                        radial-gradient(circle at 85% 10%, rgba(27, 185, 138, 0.10), transparent 40%),
+                        radial-gradient(circle at 15% 20%, rgba(var(--accent-rgb), 0.12), transparent 35%),
+                        radial-gradient(circle at 85% 10%, rgba(var(--accent2-rgb), 0.10), transparent 40%),
                         linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(244, 242, 239, 0.85)),
                         var(--bg);
                     font-family: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
                     color: var(--text);
                     margin: 0;
                 }
-                .page { padding: 28px; max-width: 1200px; margin: 0 auto; }
+                .page { padding: 32px; max-width: 1240px; margin: 0 auto; }
                 .hero {
                     display: flex;
                     align-items: center;
@@ -901,7 +960,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border-radius: 20px;
                     box-shadow: var(--shadow);
                     border: 1px solid var(--border);
-                    margin-bottom: 18px;
+                    margin-bottom: 20px;
                     backdrop-filter: blur(10px);
                 }
                 .hero-copy { display: flex; flex-direction: column; gap: 6px; }
@@ -921,7 +980,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 .hero-subtitle { color: var(--muted); margin-top: 4px; max-width: 520px; }
                 .hero-meta-wrap { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
                 .hero-meta { font-size: 14px; font-weight: 600; color: var(--accent-strong); }
-                .tabs { margin-top: var(--space-2); }
+                .tabs { margin-top: 0; }
                 .tabs .tab { background: transparent; border: none; }
                 .tabs .tab-selected {
                     background: var(--panel);
@@ -929,10 +988,22 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border-bottom: 2px solid var(--accent);
                     box-shadow: var(--glow);
                 }
-                .tab-content { display: flex; flex-direction: column; gap: var(--space-3); }
+                .tab-content { display: flex; flex-direction: column; gap: var(--space-3); padding-top: var(--space-2); }
                 .dashboard-stack { display: flex; flex-direction: column; gap: var(--space-3); }
-                .stack { display: flex; flex-direction: column; gap: var(--space-2); }
-                .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--space-2); margin-bottom: 0; }
+                .stack { display: flex; flex-direction: column; gap: var(--space-3); }
+                .controls-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+                    gap: var(--space-2);
+                    align-items: stretch;
+                }
+                .controls-grid .card { padding: 14px 16px; }
+                .cards {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+                    gap: var(--space-2);
+                    margin-bottom: var(--space-2);
+                }
                 .card {
                     background: var(--card);
                     padding: 16px 18px;
@@ -948,7 +1019,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     top: -30px;
                     width: 90px;
                     height: 90px;
-                    background: radial-gradient(circle, rgba(15, 111, 255, 0.14), transparent 70%);
+                    background: radial-gradient(circle, rgba(var(--accent-rgb), 0.14), transparent 70%);
                 }
                 .kpi-label {
                     color: var(--muted);
@@ -960,12 +1031,11 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 .kpi-subvalue { font-size: 14px; font-weight: 600; margin-top: 6px; color: var(--accent-strong); }
                 .kpi-delta { color: #149f76; font-size: 12px; margin-top: 4px; }
                 .shadow { box-shadow: var(--shadow); }
-                .mode-toggle label { font-size: 13px; color: var(--text); }
-                .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-2); }
+                .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--space-3); }
                 .panel-graph {
                     background: var(--card);
                     border-radius: 16px;
-                    padding: 6px;
+                    padding: 10px;
                     box-shadow: var(--shadow);
                     border: 1px solid var(--border);
                 }
@@ -978,8 +1048,8 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     color: var(--muted);
                 }
                 .section-subtitle { color: var(--muted); margin-top: 6px; }
-                .section-head { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
-                .section-block { display: flex; flex-direction: column; gap: var(--space-2); }
+                .section-head { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+                .section-block { display: flex; flex-direction: column; gap: var(--space-3); }
                 .subtitle { color: var(--muted); margin: 6px 0 12px 0; }
                 .panel {
                     padding: var(--space-3);
@@ -994,7 +1064,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border-radius: 12px;
                     border: 1px solid var(--border);
                     padding: 12px;
-                    background: #fefefe;
+                    background: var(--surface);
                     color: var(--text);
                     font-size: 14px;
                 }
@@ -1006,7 +1076,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border-radius: 12px;
                     cursor: pointer;
                     font-weight: 600;
-                    box-shadow: 0 12px 24px rgba(15, 111, 255, 0.18);
+                    box-shadow: 0 12px 24px rgba(var(--accent-rgb), 0.18);
                 }
                 .primary-btn:hover { opacity: 0.95; }
                 .pill-label {
@@ -1014,7 +1084,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     align-items: center;
                     padding: 4px 10px;
                     border-radius: 999px;
-                    background: rgba(15, 111, 255, 0.08);
+                    background: rgba(var(--accent-rgb), 0.08);
                     color: var(--muted);
                     font-size: 11px;
                     text-transform: uppercase;
@@ -1022,14 +1092,14 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 }
                 .answer-card { margin-top: 6px; color: var(--text); }
                 .code-block {
-                    background: #f3f5fb;
+                    background: var(--surface-alt);
                     color: #30394f;
                     padding: 12px;
                     border-radius: 12px;
                     white-space: pre-wrap;
                     border: 1px solid var(--border);
                 }
-                .subtabs { margin-top: var(--space-2); }
+                .subtabs { margin-top: var(--space-3); }
                 .subtabs .tab { background: transparent; }
                 .subtabs .tab-selected {
                     background: var(--panel);
@@ -1047,14 +1117,14 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border-right: 1px solid var(--border);
                     padding: 8px 10px;
                     min-height: 110px;
-                    background: #ffffff;
+                    background: var(--surface);
                 }
                 .cal-cell:nth-child(7n) { border-right: none; }
                 .cal-empty { background: #f1f3f7; }
                 .cal-day { font-weight: 600; font-size: 12px; color: var(--text); margin-bottom: 6px; }
                 .cal-events { display: flex; flex-direction: column; gap: 4px; }
                 .cal-chip-btn {
-                    background: rgba(15, 111, 255, 0.12);
+                    background: rgba(var(--accent-rgb), 0.12);
                     color: #1f2a4b;
                     padding: 4px 6px;
                     border-radius: 8px;
@@ -1066,10 +1136,10 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     border: none;
                     cursor: pointer;
                 }
-                .cal-chip-btn:hover { background: rgba(15, 111, 255, 0.2); }
+                .cal-chip-btn:hover { background: rgba(var(--accent-rgb), 0.2); }
                 .cal-more { font-size: 11px; color: var(--muted); }
                 .calendar-empty { color: var(--muted); }
-                .calendar-toolbar { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); flex-wrap: wrap; }
+                .calendar-toolbar { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); flex-wrap: wrap; }
                 .calendar-time { min-width: 180px; }
                 .day-list { display: flex; flex-direction: column; gap: var(--space-2); }
                 .day-item-btn {
@@ -1079,11 +1149,11 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     padding: 10px 12px;
                     border-radius: 12px;
                     border: 1px solid var(--border);
-                    background: #ffffff;
+                    background: var(--surface);
                     text-align: left;
                     cursor: pointer;
                 }
-                .day-item-btn:hover { border-color: rgba(15, 111, 255, 0.4); background: rgba(15, 111, 255, 0.04); }
+                .day-item-btn:hover { border-color: rgba(var(--accent-rgb), 0.4); background: rgba(var(--accent-rgb), 0.04); }
                 .day-time { font-weight: 600; color: var(--text); }
                 .day-details { display: flex; flex-direction: column; gap: 2px; }
                 .day-title { font-weight: 600; }
@@ -1093,7 +1163,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     padding: 12px;
                     border-radius: 12px;
                     border: 1px solid var(--border);
-                    background: #ffffff;
+                    background: var(--surface);
                 }
                 h2, h3 { color: var(--text); }
 
@@ -1122,7 +1192,7 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 .DateInput_input__focused {
                     border: none;
                     outline: none;
-                    background: rgba(15, 111, 255, 0.08);
+                    background: rgba(var(--accent-rgb), 0.08);
                     border-radius: 8px;
                 }
                 .CalendarDay__default {
@@ -1130,8 +1200,8 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     color: var(--text);
                 }
                 .CalendarDay__default:hover {
-                    background: rgba(15, 111, 255, 0.08);
-                    border: 1px solid rgba(15, 111, 255, 0.2);
+                    background: rgba(var(--accent-rgb), 0.08);
+                    border: 1px solid rgba(var(--accent-rgb), 0.2);
                 }
                 .CalendarDay__selected, .CalendarDay__selected:active, .CalendarDay__selected:hover {
                     background: var(--accent);
@@ -1139,17 +1209,17 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     color: #ffffff;
                 }
                 .CalendarDay__selected_span, .CalendarDay__selected_span:hover {
-                    background: rgba(15, 111, 255, 0.18);
-                    border: 1px solid rgba(15, 111, 255, 0.18);
+                    background: rgba(var(--accent-rgb), 0.18);
+                    border: 1px solid rgba(var(--accent-rgb), 0.18);
                     color: var(--text);
                 }
                 .CalendarDay__hovered_span, .CalendarDay__hovered_span:hover {
-                    background: rgba(15, 111, 255, 0.12);
-                    border: 1px solid rgba(15, 111, 255, 0.12);
+                    background: rgba(var(--accent-rgb), 0.12);
+                    border: 1px solid rgba(var(--accent-rgb), 0.12);
                     color: var(--text);
                 }
                 .DayPickerKeyboardShortcuts_show__bottomRight {
-                    border-right: 33px solid rgba(15, 111, 255, 0.3);
+                    border-right: 33px solid rgba(var(--accent-rgb), 0.3);
                 }
 
                 /* DatePickerSingle aligns with DateRangePicker */
@@ -1189,11 +1259,11 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                     color: var(--text);
                 }
                 .Select-option.is-focused {
-                    background: rgba(15, 111, 255, 0.08);
+                    background: rgba(var(--accent-rgb), 0.08);
                     color: var(--text);
                 }
                 .Select-option.is-selected {
-                    background: rgba(15, 111, 255, 0.18);
+                    background: rgba(var(--accent-rgb), 0.18);
                     color: var(--text);
                 }
                 .Select-arrow { border-color: var(--muted) transparent transparent; }
@@ -1202,9 +1272,11 @@ def build_app(metrics, figs, businesses, default_primary_id, default_secondary_i
                 @media (max-width: 900px) {
                     .hero { flex-direction: column; align-items: flex-start; }
                     .hero-meta-wrap { align-items: flex-start; }
+                    .page { padding: 24px; }
                 }
                 @media (max-width: 600px) {
                     .page { padding: 18px; }
+                    .controls-grid { grid-template-columns: 1fr; }
                     .cards { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
                     .row { grid-template-columns: 1fr; }
                 }
@@ -1231,17 +1303,22 @@ def main():
         print("No businesses found. Run database initialization first.")
         return
     business_name_map = {b["id"]: b["name"] for b in businesses}
-    default_primary_id = businesses[0]["id"]
-    default_secondary_id = businesses[1]["id"] if len(businesses) > 1 else businesses[0]["id"]
+    business_theme_map = load_business_themes()
+    config_file = os.getenv("CONFIG_FILE")
+    selected_business_id = resolve_business_from_config(businesses, config_file) or businesses[0]["id"]
+    selected_business_name = business_name_map.get(selected_business_id, f"Business {selected_business_id}")
     try:
-        appts, calls, hours, kpis = load_data(eng, business_ids=[default_primary_id])
+        appts, calls, hours, kpis = load_data(eng, business_ids=[selected_business_id])
     except OperationalError as e:
         print(f"Database connection failed: {e}")
         print("Check that MySQL is reachable with your DB_* env vars.")
         return
     metrics = compute_metrics(appts, calls, hours, kpis)
-    figs = build_figures(metrics)
-    app = build_app(metrics, figs, businesses, default_primary_id, default_secondary_id)
+    initial_theme = resolve_dashboard_theme(selected_business_id, business_name_map, business_theme_map)
+    initial_style = build_dashboard_theme_style(selected_business_id, business_name_map, business_theme_map)
+    figs = build_figures(metrics, theme=initial_theme)
+    app = build_app(metrics, figs, selected_business_name, initial_theme=initial_theme)
+    app.layout.style = initial_style
 
     # Callback: date range refresh
     @app.callback(
@@ -1249,32 +1326,20 @@ def main():
         [
             Input("date-range", "start_date"),
             Input("date-range", "end_date"),
-            Input("view-mode", "value"),
-            Input("business-primary", "value"),
-            Input("business-secondary", "value"),
         ],
     )
-    def update_dashboard(start_date, end_date, view_mode, business_primary, business_secondary):
+    def update_dashboard(start_date, end_date):
         try:
             start = pd.to_datetime(start_date).date() if start_date else None
             end = pd.to_datetime(end_date).date() if end_date else None
-            primary_id = int(business_primary or default_primary_id)
-            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[primary_id])
+            theme = resolve_dashboard_theme(selected_business_id, business_name_map, business_theme_map)
+            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[selected_business_id])
             metrics_f = compute_metrics(appts_f, calls_f, hours_f, kpis_f)
-            figs_f = build_figures(metrics_f)
-            primary_name = business_name_map.get(primary_id, f"Business {primary_id}")
-            if view_mode == "compare":
-                secondary_id = int(business_secondary or primary_id)
-                if secondary_id == primary_id:
-                    return html.Div("Choose a different secondary business to compare.", className="card")
-                appts_b, calls_b, hours_b, kpis_b = load_data(eng, start, end, business_ids=[secondary_id])
-                metrics_b = compute_metrics(appts_b, calls_b, hours_b, kpis_b)
-                secondary_name = business_name_map.get(secondary_id, f"Business {secondary_id}")
-                return serve_comparison_layout(primary_name, metrics_f, secondary_name, metrics_b)
+            figs_f = build_figures(metrics_f, theme=theme)
             return serve_layout(
                 metrics_f,
                 figs_f,
-                headline=f"{primary_name} Dashboard",
+                headline=f"{selected_business_name} Dashboard",
                 subtitle="Performance snapshot across bookings, revenue, and staffing.",
             )
         except Exception as e:
@@ -1289,17 +1354,16 @@ def main():
         [
             Input("date-range", "start_date"),
             Input("date-range", "end_date"),
-            Input("business-primary", "value"),
         ],
     )
-    def update_calendar_context(start_date, end_date, business_primary):
+    def update_calendar_context(start_date, end_date):
         try:
             start = pd.to_datetime(start_date).date() if start_date else None
             end = pd.to_datetime(end_date).date() if end_date else None
-            primary_id = int(business_primary or default_primary_id)
-            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[primary_id])
+            theme = resolve_dashboard_theme(selected_business_id, business_name_map, business_theme_map)
+            appts_f, calls_f, hours_f, kpis_f = load_data(eng, start, end, business_ids=[selected_business_id])
             metrics_f = compute_metrics(appts_f, calls_f, hours_f, kpis_f)
-            timeline, month_view, _ = build_calendar_views(metrics_f)
+            timeline, month_view, _ = build_calendar_views(metrics_f, theme=theme)
             payload = build_calendar_payload(metrics_f["appts"]).to_dict(orient="records")
             return payload, timeline, month_view
         except Exception as e:
@@ -1320,10 +1384,13 @@ def main():
 
     @app.callback(
         Output("calendar-detail", "children"),
-        [Input({"type": "cal-event", "index": ALL}, "n_clicks")],
+        [
+            Input({"type": "cal-event-month", "index": ALL}, "n_clicks"),
+            Input({"type": "cal-event-day", "index": ALL}, "n_clicks"),
+        ],
         [State("calendar-data", "data")]
     )
-    def update_calendar_detail(n_clicks, data):
+    def update_calendar_detail(month_clicks, day_clicks, data):
         if not data:
             return "Select an event to see details."
         ctx = callback_context
@@ -1365,15 +1432,14 @@ def main():
     @app.callback(
         [Output("qa-answer", "children"), Output("qa-sql", "children")],
         [Input("qa-submit", "n_clicks")],
-        [State("qa-input", "value"), State("business-primary", "value")]
+        [State("qa-input", "value")]
     )
-    def run_analytics(n_clicks, question, business_primary):
+    def run_analytics(n_clicks, question):
         if not n_clicks or not question:
             return "", ""
-        primary_id = int(business_primary or default_primary_id)
         scoped_question = (
             f"{question}\n"
-            f"Scope analytics to business_id={primary_id} whenever the referenced table has a business_id column."
+            f"Scope analytics to business_id={selected_business_id} whenever the referenced table has a business_id column."
         )
         plan = agent.generate_sql(scoped_question)
         if plan.get("error"):

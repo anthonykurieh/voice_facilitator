@@ -21,6 +21,7 @@ from src.analytics_agent import AnalyticsAgent
 from src.tts import TextToSpeech
 from src.stt import SpeechToText
 from src.config import OPENAI_API_KEY
+from src.conversation_ui import ConversationUI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -96,11 +97,17 @@ def interactive_loop(use_voice: bool = False):
     engine = get_engine()
     tts = TextToSpeech(OPENAI_API_KEY)
     stt = SpeechToText(OPENAI_API_KEY)
+    chat_ui = ConversationUI(
+        title="Admin Conversational Analytics",
+        subtitle="Voice-only analytics chat transcript.",
+        role_labels={"user": "Admin", "assistant": "Analytics Agent", "system": "System"},
+    )
 
     print("\nAdmin Analytics. Ask a question (type or speak). Ctrl+C to exit.\n")
     while True:
         try:
             if use_voice:
+                chat_ui.set_status("Listening for admin question...")
                 question = stt.listen()
                 if not question.strip():
                     print("(No speech detected)")
@@ -110,14 +117,18 @@ def interactive_loop(use_voice: bool = False):
                 question = input("You: ").strip()
                 if not question:
                     continue
+            chat_ui.add_turn("user", question)
             current_question = question
             for _ in range(2):
                 result = answer_question(agent, engine, current_question, speak=use_voice, tts=tts)
                 if result.get("needs_clarification"):
                     follow_up = result.get("clarification_question", "Can you clarify?")
                     print(f"Assistant: {follow_up}")
+                    chat_ui.add_turn("assistant", follow_up)
                     if use_voice:
+                        chat_ui.set_status("Speaking clarification...")
                         tts.speak(follow_up)
+                        chat_ui.set_status("Listening for clarification...")
                         clar = stt.listen()
                         if not clar.strip():
                             print("(No speech detected)")
@@ -127,19 +138,24 @@ def interactive_loop(use_voice: bool = False):
                         clar = input("You: ").strip()
                         if not clar:
                             continue
+                    chat_ui.add_turn("user", clar)
                     current_question = f"{current_question} {clar}"
                     continue
                 if result.get("error"):
                     print(f"Answer: {result['error']}\n")
+                    chat_ui.add_turn("assistant", result["error"])
                 else:
                     print(f"Answer: {result['summary']}\n")
                     print(f"SQL: {result['sql']}\n")
+                    chat_ui.add_turn("assistant", result["summary"])
                 break
         except KeyboardInterrupt:
             print("\nGoodbye")
+            chat_ui.close()
             break
         except Exception as e:
             print(f"Error: {e}")
+            chat_ui.add_turn("system", f"Error: {e}")
 
 
 def main():

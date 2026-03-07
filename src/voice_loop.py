@@ -11,6 +11,7 @@ from src.tools import BackendTools
 from src.config_loader import ConfigLoader
 from src.database import Database
 from src.init_database import init_business_data
+from src.conversation_ui import ConversationUI
 
 # Set up logging
 logging.basicConfig(
@@ -50,6 +51,11 @@ class VoiceLoop:
         self.call_customer_id = None
         self.call_appointment_id = None
         self.business_id = int(self.config.get("business.id", 1))
+        self.chat_ui = ConversationUI(
+            title="Customer Voice Conversation",
+            subtitle="Voice-only mode with live transcript.",
+            role_labels={"user": "Customer", "assistant": "Agent", "system": "System"}
+        )
         
         # Initialize database schema
         logger.info("Initializing database...")
@@ -86,6 +92,7 @@ class VoiceLoop:
         print(f"Assistant: {greeting}")
         self.tts.speak(self._humanize_times_in_text(greeting))
         self._log_turn("assistant", greeting)
+        self.chat_ui.add_turn("assistant", greeting)
         
         # Main loop
         conversation_complete = False
@@ -96,6 +103,7 @@ class VoiceLoop:
             try:
                 # Listen
                 logger.info("Listening for user input...")
+                self.chat_ui.set_status("Listening...")
                 user_input = self.stt.listen()
                 
                 if not user_input.strip():
@@ -106,6 +114,7 @@ class VoiceLoop:
                 logger.info(f"User said: {user_input}")
                 print(f"\nUser: {user_input}")
                 self._log_turn("user", user_input)
+                self.chat_ui.add_turn("user", user_input)
                 
                 # Think
                 logger.info("Processing user input with agent...")
@@ -118,7 +127,6 @@ class VoiceLoop:
                 
                 logger.info(f"Assistant response: {response_text}")
                 print(f"Assistant: {response_text}")
-                self._log_turn("assistant", response_text)
                 
                 # Act (if action needed)
                 action = agent_decision.get('action')
@@ -349,7 +357,11 @@ class VoiceLoop:
                 
                 # Speak
                 logger.info("Speaking response...")
+                self._log_turn("assistant", response_text)
+                self.chat_ui.add_turn("assistant", response_text)
+                self.chat_ui.set_status("Speaking...")
                 self.tts.speak(self._humanize_times_in_text(response_text))
+                self.chat_ui.set_status("Listening...")
                 
                 # Check if conversation is complete
                 conversation_complete = agent_decision.get('conversation_complete', False)
@@ -378,6 +390,7 @@ class VoiceLoop:
             print(f"\nAssistant: {closing}")
             self.tts.speak(self._humanize_times_in_text(closing))
             self._log_turn("assistant", closing)
+            self.chat_ui.add_turn("assistant", closing)
         
         # Cleanup
         self.cleanup()
@@ -388,6 +401,7 @@ class VoiceLoop:
         logger.info("Cleaning up resources...")
         print("\nCleaning up...")
         self.stt.cleanup()
+        self.chat_ui.close()
         logger.info("Voice assistant stopped.")
         print("Voice assistant stopped.")
 

@@ -127,7 +127,7 @@ class DemoLauncher(tk.Tk):
         self._add_button(
             self.admin_frame,
             "Open Admin Dashboard",
-            lambda: self._launch("dashboard", [sys.executable, "dashboard_dash.py"]),
+            self._launch_dashboard,
         )
         self._add_button(
             self.admin_frame,
@@ -239,6 +239,16 @@ class DemoLauncher(tk.Tk):
         env["CONFIG_FILE"] = rel_path
         self._launch("voice_bot", [sys.executable, "main.py"], env=env)
 
+    def _launch_dashboard(self):
+        selected = self.config_var.get()
+        rel_path = self.config_map.get(selected)
+        if not rel_path:
+            messagebox.showerror("Missing config", "Please select a business config first.")
+            return
+        env = os.environ.copy()
+        env["CONFIG_FILE"] = rel_path
+        self._launch("dashboard", [sys.executable, "dashboard_dash.py"], env=env)
+
     def _launch_business_builder(self):
         self._launch(
             "business_builder",
@@ -321,7 +331,7 @@ class DemoLauncher(tk.Tk):
                 env=env or os.environ.copy(),
             )
             self.processes[key] = proc
-            if key == "voice_bot" and env and env.get("CONFIG_FILE"):
+            if key in {"voice_bot", "dashboard"} and env and env.get("CONFIG_FILE"):
                 self.status.set(f"Running: {key.replace('_', ' ')} ({env['CONFIG_FILE']})")
             else:
                 self.status.set(f"Running: {key.replace('_', ' ')}")
